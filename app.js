@@ -69,7 +69,7 @@ async function sealBytes(bytes,aad,key=K.aes){const iv=crypto.getRandomValues(ne
 async function openBytes(buf,aad,key=K.aes){const b=new Uint8Array(buf);if(b.length<29)throw new Error("kurz");
   return new Uint8Array(await crypto.subtle.decrypt({name:"AES-GCM",iv:b.slice(0,12),additionalData:TE.encode(aad)},key,b.slice(12)))}
 function padTo(bytes,block,fill=0x20){const n=Math.ceil((bytes.length+1)/block)*block;const out=new Uint8Array(n).fill(fill);out.set(bytes);return out}
-async function seal(obj,id){return "v1."+b64(await sealBytes(padTo(TE.encode(JSON.stringify(obj)),256),"row:"+id))}
+async function seal(obj,id){return "v1."+b64(await sealBytes(padTo(TE.encode(JSON.stringify(obj)),512),"row:"+id))}
 async function unseal(blob,id,key=K.aes){if(typeof blob!=="string"||!blob.startsWith("v1."))throw new Error("format");return JSON.parse(TD.decode(await openBytes(unb64(blob.slice(3)),"row:"+id,key)))}
 async function tagId(label){return "r"+hex(await crypto.subtle.sign("HMAC",K.hmac,TE.encode(label))).slice(0,32)}
 const randId=()=>"r"+hex(crypto.getRandomValues(new Uint8Array(16)));
@@ -90,50 +90,78 @@ let toastT;
 function toast(msg){let t=$(".toast");if(!t){t=document.createElement("div");t.className="toast";t.setAttribute("role","status");document.body.appendChild(t)}t.textContent=msg;clearTimeout(toastT);toastT=setTimeout(()=>t.remove(),3400)}
 const isNet=e=>/fetch|network|load failed|NetworkError|Failed to fetch|AuthRetryableFetchError/i.test(String(e?.message||e||"")+" "+String(e?.name||""));
 function errText(e){const m=String(e?.message||e||"");if(isNet(e))return "Keine Verbindung. Internet prüfen und nochmals versuchen.";if(/JWT|session|token/i.test(m))return "Anmeldung abgelaufen. Bitte neu anmelden.";if(/row-level|permission|policy|geschützt/i.test(m))return "Keine Berechtigung für diese Daten.";return "Das hat nicht geklappt. Bitte nochmals versuchen."}
-const WQ={},PEND=new Map,SENT=new Set,CONF=new Map,TOUCH=new Map;let SEQ=0,RTQ=Promise.resolve();
+const WQ={},PEND=new Map,SENT=new Set,CONF=new Map,TOUCH=new Map,CLOG=new Map,DRAFTS=new Map;let SEQ=0,CSEQ=0,GEN=0,RTQ=Promise.resolve();
 function queue(k,run){return WQ[k]=(WQ[k]||Promise.resolve()).then(run,run)}
 function rebuild(){S.orte=new Map;S.boxen=new Map;S.boxIds=new Map;S.artikel=new Map;S.meta={};S.metaId=null;
   for(const [id,o] of S.rows){if(!o||typeof o!=="object")continue;
     if(o.t==="ort")S.orte.set(id,o);else if(o.t==="box"&&o.nr){S.boxen.set(o.nr,{...o,_id:id});S.boxIds.set(o.nr,id)}else if(o.t==="artikel")S.artikel.set(id,o);else if(o.t==="meta"){S.meta=o;S.metaId=id}}}
 function localSet(id,val){val===undefined?S.rows.delete(id):S.rows.set(id,val);TOUCH.set(id,{seq:++SEQ,val});rebuild();scheduleRender()}
+/* CONF = letzter bestätigter Stand der Datenbank; CLOG hält Änderungen fest, die während eines Ladevorgangs eintreffen */
+function confSet(id,val){val===undefined?CONF.delete(id):CONF.set(id,val);CLOG.set(id,{seq:++CSEQ,val})}
 const pendInc=id=>PEND.set(id,(PEND.get(id)||0)+1),pendDec=id=>{const n=(PEND.get(id)||1)-1;n?PEND.set(id,n):PEND.delete(id)};
-function putRow(id,obj){localSet(id,obj);pendInc(id);
-  return queue(id,async()=>{let blob=null;try{blob=await seal(obj,id);SENT.add(blob);const {error}=await sb.from("daten").upsert({id,blob});if(error)throw error;CONF.set(id,obj);return true}
-    catch(e){if(blob)SENT.delete(blob);if(S.rows.get(id)===obj)localSet(id,CONF.get(id));toast(errText(e));return false}
+async function sendRow(id,o){const blob=await seal(o,id);SENT.add(blob);let r;try{r=await sb.from("daten").upsert({id,blob})}catch(e){SENT.delete(blob);throw e}
+  if(r.error){SENT.delete(blob);throw r.error}confSet(id,o)}
+/* Nur anlegen, nie überschreiben. Gibt bei bestehender Zeile deren Inhalt aus der Datenbank zurück. */
+async function createOnly(id,o){const blob=await seal(o,id);SENT.add(blob);let r;try{r=await sb.from("daten").upsert({id,blob},{onConflict:"id",ignoreDuplicates:true}).select("id")}catch(e){SENT.delete(blob);throw e}
+  if(r.error){SENT.delete(blob);throw r.error}if(r.data&&r.data.length){confSet(id,o);return null}SENT.delete(blob);
+  const {data:row,error}=await sb.from("daten").select("blob").eq("id",id).maybeSingle();if(error)throw error;if(!row)throw new Error("Konflikt beim Speichern");
+  const srv=await unseal(row.blob,id);confSet(id,srv);return srv}
+/* Schreibt eine Zeile. Mit opt.patch wird auf den Stand der Datenbank aufgesetzt, damit Änderungen vom anderen Gerät erhalten bleiben.
+   opt.keep: eine bestehende Zeile nie verändern (Import). */
+function putRow(id,obj,opt={}){localSet(id,obj);pendInc(id);const gen=GEN;
+  return queue(id,async()=>{try{if(gen!==GEN)return false;let o=obj;
+      if(opt.patch){
+        if(!CONF.has(id)){const srv=await createOnly(id,obj);if(!srv)return true;if(opt.keep){if(S.rows.get(id)===obj)localSet(id,srv);return true}}
+        else if(opt.keep){if(S.rows.get(id)===obj)localSet(id,CONF.get(id));return true}
+        o={...CONF.get(id),...opt.patch}}
+      await sendRow(id,o);if(o!==obj&&S.rows.get(id)===obj&&JSON.stringify(o)!==JSON.stringify(obj))localSet(id,o);return true}
+    catch(e){if(gen===GEN){if(S.rows.get(id)===obj)localSet(id,CONF.get(id));toast(errText(e))}return false}
     finally{pendDec(id)}})}
-function delRow(id){if(!S.rows.has(id)&&!CONF.has(id))return Promise.resolve(true);localSet(id,undefined);pendInc(id);
-  return queue(id,async()=>{try{const {error}=await sb.from("daten").delete().eq("id",id);if(error)throw error;CONF.delete(id);return true}
-    catch(e){if(!S.rows.has(id)&&CONF.has(id))localSet(id,CONF.get(id));toast(errText(e));return false}
+function delRow(id){if(!S.rows.has(id)&&!CONF.has(id))return Promise.resolve(true);localSet(id,undefined);pendInc(id);const gen=GEN;
+  return queue(id,async()=>{try{if(gen!==GEN)return false;const {error}=await sb.from("daten").delete().eq("id",id);if(error)throw error;confSet(id,undefined);return true}
+    catch(e){if(gen===GEN){if(!S.rows.has(id)&&CONF.has(id))localSet(id,CONF.get(id));toast(errText(e))}return false}
     finally{pendDec(id)}})}
 async function boxIdFor(nr){return S.boxIds.get(nr)||await tagId("box:"+nr)}
-async function saveBox(nr,patch){const id=await boxIdFor(nr);const cur=S.boxen.get(nr);const now=new Date().toISOString();
-  const o={t:"box",nr,name:"",ortId:"",foto:null,erstellt:now,...(cur||{}),...patch,geaendert:now};delete o._id;return putRow(id,o)}
+async function saveBox(nr,patch,opt={}){const id=await boxIdFor(nr);const cur=S.boxen.get(nr);const now=new Date().toISOString();const p={...patch,geaendert:now};
+  const o={t:"box",nr,name:"",ortId:"",foto:null,erstellt:now,...(cur||{}),...p};delete o._id;return putRow(id,o,{patch:p,keep:opt.keep})}
 async function addItems(nr,list){list=list.filter(o=>o.name);if(!list.length)return [];
   if(!S.boxen.has(nr)&&!(await saveBox(nr,{})))return list;
   const ids=list.map(()=>randId());S.flashId=ids[0];
   const res=await Promise.all(list.map((o,i)=>putRow(ids[i],{t:"artikel",boxNr:nr,name:o.name,menge:o.menge??1,erstellt:new Date(Date.now()+i).toISOString()})));
   const failed=list.filter((o,i)=>!res[i]);if(!failed.length&&list.length>1)toast(`${list.length} Gegenstände hinzugefügt`);return failed}
-function setItem(id,patch){const a=S.artikel.get(id);if(a)return putRow(id,{...a,...patch});return Promise.resolve(false)}
+function setItem(id,patch){const a=S.artikel.get(id);if(a)return putRow(id,{...a,...patch},{patch});return Promise.resolve(false)}
 async function deleteBox(nr){const b=S.boxen.get(nr);if(!b)return;S.armed=null;
   const r=await Promise.all(itemsOf(nr).map(([id])=>delRow(id)));if(!r.every(Boolean))return;
   if(!(await delRow(b._id)))return;if(b.foto)removeFoto(b.foto);toast(`Box ${nr} gelöscht, die Nummer ist wieder frei.`);go("suchen")}
 async function newOrt(parentId,name){const id=randId();const lvl=parentId?Math.min(2,ortPath(parentId).length):0;
   const ok=await putRow(id,{t:"ort",name:String(name||NEU[lvl]).slice(0,80),parentId:parentId||"",sort:childrenOf(parentId).length});return ok?id:null}
 
-async function fetchAll(){const rows=[];for(let from=0;;from+=1000){const {data,error}=await sb.from("daten").select("id,blob").neq("id",KEY_ID).order("id").range(from,from+999);if(error)throw error;rows.push(...data);if(data.length<1000)break}
+async function fetchAll(){const rows=[];let last="";
+  for(;;){let q=sb.from("daten").select("id,blob").neq("id",KEY_ID).order("id").limit(1000);if(last)q=q.gt("id",last);
+    const {data,error}=await q;if(error)throw error;rows.push(...data);if(data.length<1000)break;last=data[data.length-1].id}
   const map=new Map;let bad=0;await Promise.all(rows.map(async r=>{try{map.set(r.id,await unseal(r.blob,r.id))}catch(e){bad++}}));return {map,bad}}
-async function loadAll(quiet){if(!quiet){S.phase="app";S.status="connecting";render()}
-  try{subscribe();await Promise.all(Object.values(WQ));const since=SEQ;const {map,bad}=await fetchAll();
+/* Immer nur ein Ladevorgang gleichzeitig; Anfragen währenddessen lösen danach genau einen weiteren aus */
+let loadP=null,loadAgain=false;
+function resync(quiet=true){if(!quiet&&S.phase!=="app"){S.phase="app";S.status="connecting";render()}if(loadP){loadAgain=true;return loadP}
+  loadP=loadAll(quiet).finally(()=>{loadP=null;if(loadAgain){loadAgain=false;if(S.phase==="app")resync(true)}});return loadP}
+async function loadAll(quiet){const gen=GEN;if(!quiet){S.phase="app";S.status="connecting";render()}
+  try{subscribe();const since=SEQ;await Promise.all(Object.values(WQ));const cmark=CSEQ;const {map,bad}=await fetchAll();if(gen!==GEN)return;
     CONF.clear();for(const [id,o] of map)CONF.set(id,o);
+    for(const [id,c] of CLOG){if(c.seq>cmark)c.val===undefined?CONF.delete(id):CONF.set(id,c.val)}CLOG.clear();
     for(const [id,t] of TOUCH){if(t.seq>since){t.val===undefined?map.delete(id):map.set(id,t.val)}else TOUCH.delete(id)}
     S.rows=map;S.bad=bad;rebuild();S.loaded=true;S.status="ok";S.lastLoad=Date.now();render()}
-  catch(e){S.status="bad";S.gateMsg=errText(e);render()}}
+  catch(e){if(gen!==GEN)return;S.status="bad";S.gateMsg=errText(e);render()}}
 async function handleRT(p){
-  if(p.eventType==="DELETE"){const id=p.old?.id;if(!id||id===KEY_ID)return;CONF.delete(id);if(PEND.get(id))return;if(S.rows.has(id))localSet(id,undefined);return}
+  if(p.eventType==="DELETE"){const id=p.old?.id;if(!id||id===KEY_ID)return;confSet(id,undefined);if(PEND.get(id))return;localSet(id,undefined);return}
   const r=p.new;if(!r||r.id===KEY_ID)return;if(SENT.delete(r.blob))return;
-  const o=await unseal(r.blob,r.id);CONF.set(r.id,o);if(PEND.get(r.id))return;localSet(r.id,o)}
-function subscribe(){if(S.chan||!sb.channel)return;
-  S.chan=sb.channel("daten-live").on("postgres_changes",{event:"*",schema:"public",table:"daten"},p=>{RTQ=RTQ.then(()=>handleRT(p)).catch(()=>{})}).subscribe()}
+  const o=await unseal(r.blob,r.id);confSet(r.id,o);if(PEND.get(r.id))return;localSet(r.id,o)}
+function subscribe(){if(S.chan||!sb.channel)return;const gen=GEN;
+  const ch=sb.channel("daten-live").on("postgres_changes",{event:"*",schema:"public",table:"daten"},p=>{if(gen===GEN)RTQ=RTQ.then(()=>handleRT(p)).catch(()=>{})});S.chan=ch;
+  /* Bei jedem (Wieder-)Verbinden nachladen: Live-Meldungen aus der Lücke werden nicht nachgeliefert */
+  ch.subscribe(st=>{if(S.chan!==ch||gen!==GEN||S.phase!=="app")return;
+    if(st==="SUBSCRIBED")resync(true);else if(st==="CHANNEL_ERROR"||st==="TIMED_OUT"||st==="CLOSED"){S.status="bad";scheduleRender()}})}
+function resetData(){GEN++;loadAgain=false;const ch=S.chan;S.chan=null;try{ch&&sb.removeChannel(ch)}catch(e){}
+  K.aes=K.hmac=null;S.rows=new Map;CONF.clear();CLOG.clear();TOUCH.clear();PEND.clear();SENT.clear();DRAFTS.clear();S.addDraft="";S.lastFail=null;rebuild();S.loaded=false;fotoCache.clear()}
 
 /* ---------- Fotos (verschlüsselt, auf 64 KiB aufgefüllt, im privaten Speicher) ---------- */
 const fotoCache=new Map();
@@ -157,10 +185,12 @@ function search(q){const toks=norm(q).split(/\s+/).filter(Boolean);if(!toks.leng
 
 /* ---------- Darstellung ---------- */
 let rq;function scheduleRender(){if(rq)return;rq=setTimeout(()=>{rq=null;render()},16)}
-function saveField(t){if(!t||S.phase!=="app"||!t.matches)return;
-  if(t.id==="bx-name"){const v=t.value.trim().slice(0,80);const b=S.boxen.get(S.boxNr);if(v!==(b?.name||"")&&(b||v))saveBox(S.boxNr,{name:v})}
-  else if(t.classList.contains("ie-name")){const v=t.value.trim().slice(0,120);const a=S.artikel.get(t.dataset.id);if(a&&v&&v!==a.name)setItem(t.dataset.id,{name:v})}
-  else if(t.classList.contains("en-in")){const v=t.value.trim().slice(0,80);const o=S.orte.get(t.dataset.ort);if(o&&v&&v!==o.name)putRow(t.dataset.ort,{...o,name:v})}}
+function saveField(t,fromRender){if(!t||S.phase!=="app"||!t.matches)return;let job=null,v="";
+  if(t.id==="bx-name"){v=t.value.trim().slice(0,80);const nr=S.boxNr,b=S.boxen.get(nr);if(v!==(b?.name||"")&&(b||v))job=()=>saveBox(nr,{name:v})}
+  else if(t.classList.contains("ie-name")){v=t.value.trim().slice(0,120);const id=t.dataset.id,a=S.artikel.get(id);if(a&&v&&v!==a.name)job=()=>setItem(id,{name:v})}
+  else if(t.classList.contains("en-in")){v=t.value.trim().slice(0,80);const id=t.dataset.ort,o=S.orte.get(id);if(o&&v&&v!==o.name)job=()=>putRow(id,{...o,name:v},{patch:{name:v}})}
+  if(!job)return;const key=(t.id||"")+"\u0001"+v;if(fromRender&&S.lastFail===key)return;
+  Promise.resolve(job()).then(ok=>{if(!ok)S.lastFail=key;else if(S.lastFail===key)S.lastFail=null})}
 function render(){
   const gate=S.phase!=="app";document.body.classList.toggle("gate",gate);
   const st=$("#status");st.textContent=gate?"Privat · verschlüsselt":S.status==="ok"?"Verschlüsselt · verbunden":S.status==="bad"?"Keine Verbindung":"Verbinde …";
@@ -168,7 +198,7 @@ function render(){
   $("#helpbtn").hidden=gate&&!["denied","unlock","error"].includes(S.phase);
   const m=$("#main");const ae=document.activeElement;
   if(gate){m.innerHTML=viewGate();if(S.focusId){const el=document.getElementById(S.focusId);S.focusId=null;el?.focus()}return}
-  if(ae&&ae.matches?.("#bx-name,.ie-name,.en-in"))saveField(ae);
+  if(ae&&ae.matches?.("#bx-name,.ie-name,.en-in"))saveField(ae,true);
   const navV=S.view==="box"?S.lastView:S.view;
   document.querySelectorAll("#nav [data-v]").forEach(b=>b.setAttribute("aria-current",String(b.dataset.v===navV&&!S.q.trim())));
   $("#qclear").hidden=!S.q;
@@ -194,7 +224,9 @@ function viewGate(){const msg=`<p class="err"${S.gateMsg?' role="alert"':""}>${e
     return `<section class="gatecard"><span class="eyebrow">Einmalig</span><h2 class="h">Haushalts-Schlüssel</h2>
     <p class="muted">Damit werden alle Boxen, Räume, Inhalte und Fotos verschlüsselt, bevor sie gespeichert werden. Niemand ohne diesen Schlüssel kann sie lesen, auch nicht der Datenbank-Anbieter. Alle Mitglieder brauchen denselben Schlüssel.</p>
     ${S.setupOwn?`<form id="setupform" novalidate>${VH}<div class="fld"><label for="su-1">Eigener Schlüssel (mindestens 20 Zeichen)</label><input id="su-1" type="password" autocomplete="new-password" minlength="20" required></div>
-      <div class="fld"><label for="su-2">Nochmals</label><input id="su-2" type="password" autocomplete="new-password" required></div>${msg}
+      <div class="fld"><label for="su-2">Nochmals</label><input id="su-2" type="password" autocomplete="new-password" required></div>
+      <label class="chk small"><input type="checkbox" id="su-notpw"> Dieser Schlüssel ist nicht mein Login-Passwort und wird nirgends sonst verwendet.</label>
+      <div class="warn small">Als eigenen Eintrag im Passwort-Manager speichern, getrennt vom Login-Passwort. Ohne ihn lassen sich die Daten nicht wiederherstellen.</div>${msg}
       <button class="btn big">Schlüssel festlegen</button><button type="button" class="linkbtn" data-act="own-off">Doch den erzeugten Code nehmen</button></form>`
     :`<div class="codebox" id="su-code" aria-label="Erzeugter Schlüssel">${esc(code)}</div>
       <div class="row"><button type="button" class="btn ghost sm" data-act="copy-code">Kopieren</button><button type="button" class="btn ghost sm" data-act="new-code">Neuen Code erzeugen</button></div>
@@ -323,7 +355,7 @@ async function drawPreview(){const c=$("#prev");if(!c||typeof qrcode==="undefine
 function lblName({items}){const a=items[0]?.nr,z=items[items.length-1]?.nr;return `Kellerboxen Etiketten ${a===z?a:a+"-"+z} (HERMA 63x38).pdf`}
 async function recordPrint(){const {items,start}=lblItems();const used=start-1+items.length;const m=S.meta||{};
   const id=S.metaId||await tagId("meta:etiketten");
-  await putRow(id,{t:"meta",bisNr:Math.max(m.bisNr||0,...items.map(i=>parseInt(i.nr,10)||0)),freiAb:used%PER===0?1:(used%PER)+1,zeit:new Date().toISOString()});
+  const mp={t:"meta",bisNr:Math.max(m.bisNr||0,...items.map(i=>parseInt(i.nr,10)||0)),freiAb:used%PER===0?1:(used%PER)+1,zeit:new Date().toISOString()};await putRow(id,mp,{patch:mp});
   S.lbl={von:null,bis:null,start:null};render();toast(`Gemerkt: nächstes Mal ab Nr. ${padNr((S.meta.bisNr||0)+1)}, Start bei Etikett ${S.meta.freiAb}.`)}
 async function savePdf(){if(!window.jspdf){toast("PDF-Modul nicht geladen. Seite neu laden.");return}
   const L=lblItems();if(!L.items.length)return;toast("PDF wird erstellt …");await lblFonts();
@@ -370,7 +402,8 @@ async function openScanner(){
   const tick=async()=>{if(stop)return;try{if(v.readyState>=2){const txt=await readQR(v);if(txt&&!stop&&labelNr(txt)){end();closeSheet();found(txt);return}}}catch(e){}timer=setTimeout(tick,250)};tick()}
 
 /* ---------- Sicherung (verschlüsselt) ---------- */
-async function exportData(){const data={orte:[...S.orte].map(([id,o])=>({id,name:o.name,parentId:o.parentId||"",sort:o.sort??0})),
+const NOTLOADED="Die Daten sind noch nicht geladen. Zuerst «Nochmals laden».";
+async function exportData(){if(!S.loaded){toast(NOTLOADED);return}const data={orte:[...S.orte].map(([id,o])=>({id,name:o.name,parentId:o.parentId||"",sort:o.sort??0})),
     boxen:sortedBoxes().map(([nr,b])=>({nr,name:b.name||"",ortId:b.ortId||""})),
     artikel:[...S.artikel.values()].map(a=>({boxNr:a.boxNr,name:a.name,menge:a.menge??1})),
     meta:{bisNr:S.meta.bisNr||0,freiAb:S.meta.freiAb||1}};
@@ -380,33 +413,40 @@ async function exportData(){const data={orte:[...S.orte].map(([id,o])=>({id,name
   const a=document.createElement("a");a.href=url;a.download=`kellerboxen-sicherung-${new Date().toISOString().slice(0,10)}.json`;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),60000);
   toast("Verschlüsselte Sicherung gespeichert. Zum Öffnen braucht es den Haushalts-Schlüssel.")}
 async function openExport(d){if(d.version===3){let key=K.aes;
-    if(d.salt!==S.keyInfo.salt){const p=await askPass();if(!p)return null;let keys=null;try{keys=await tryPass(p,d)}catch(e){}if(!keys){toast("Der Schlüssel passt nicht zu dieser Sicherung.");return null}key=keys.aes}
+    if(d.salt!==S.keyInfo.salt){const keys=await askPass(d);if(!keys)return null;key=keys.aes}
     try{return {...JSON.parse(TD.decode(await openBytes(unb64(String(d.enc).slice(3)),"export:v3",key))),exportiert:d.exportiert}}catch(e){toast("Die Sicherung lässt sich nicht entschlüsseln.");return null}}
   if(d.version===2)return d;toast("Unbekanntes Format.");return null}
-function askPass(){return new Promise(res=>{openSheet(`<span class="eyebrow">Sicherung</span><h3>Schlüssel dieser Sicherung</h3><form id="askform" novalidate>${VH}<div class="fld"><label for="ask-pw">Haushalts-Schlüssel</label><input id="ask-pw" type="password" autocomplete="current-password" spellcheck="false"></div>
-  <div class="foot"><button type="button" class="btn ghost" data-close>Abbrechen</button><button class="btn">Öffnen</button></div></form>`,sh=>{sh.querySelector("#askform").addEventListener("submit",e=>{e.preventDefault();e.stopPropagation();const v=sh.querySelector("#ask-pw").value;res(v);closeSheet()},{capture:true})},()=>res(null))})}
-async function importData(file){let d;try{d=JSON.parse(await file.text())}catch(e){toast("Diese Datei kann nicht gelesen werden.");return}
+function askPass(d){return new Promise(res=>{let done=false;
+  openSheet(`<span class="eyebrow">Sicherung</span><h3>Schlüssel dieser Sicherung</h3><p class="muted small" style="margin:0">Die Sicherung stammt aus einer anderen Einrichtung. Bitte deren Haushalts-Schlüssel eingeben.</p><form id="askform" novalidate>${VH}<div class="fld"><label for="ask-pw">Haushalts-Schlüssel</label><input id="ask-pw" type="password" autocomplete="current-password" spellcheck="false"></div><p class="err" id="ask-err"></p>
+  <div class="foot"><button type="button" class="btn ghost" data-close>Abbrechen</button><button class="btn" id="ask-ok">Öffnen</button></div></form>`,sh=>{
+    sh.querySelector("#askform").addEventListener("submit",async e=>{e.preventDefault();e.stopPropagation();const btn=sh.querySelector("#ask-ok");if(btn.disabled)return;btn.disabled=true;
+      let keys=null;try{keys=await tryPass(sh.querySelector("#ask-pw").value,d)}catch(err){}btn.disabled=false;
+      if(!keys){sh.querySelector("#ask-err").textContent="Der Schlüssel passt nicht zu dieser Sicherung.";return}done=true;res(keys);closeSheet()},{capture:true})},()=>{if(!done)res(null)})})}
+async function importData(file){if(!S.loaded||S.status!=="ok"){toast(NOTLOADED);return}let d;try{d=JSON.parse(await file.text())}catch(e){toast("Diese Datei kann nicht gelesen werden.");return}
   if(!d||d.app!=="kellerboxen"){toast("Das ist keine Kellerboxen-Sicherung.");return}
-  const data=await openExport(d);if(!data)return;
+  const data=await openExport(d);if(!data)return;if(!S.loaded||S.status!=="ok"){toast(NOTLOADED);return}
   const orte=Array.isArray(data.orte)?data.orte:[],boxen=Array.isArray(data.boxen)?data.boxen:[],artikel=Array.isArray(data.artikel)?data.artikel:[];
   openSheet(`<span class="eyebrow">Importieren</span><h3>Sicherung übernehmen?</h3><p class="muted">${orte.length} Orte, ${boxen.length} Boxen, ${artikel.length} Gegenstände. Die Daten werden zu den bestehenden hinzugefügt und dabei verschlüsselt. Ein zweiter Import derselben Datei legt nichts doppelt an.</p>
     <div class="foot"><button type="button" class="btn ghost" data-close>Abbrechen</button><button type="button" class="btn" id="imp-ok">Übernehmen</button></div>`,sh=>{
-    sh.querySelector("#imp-ok").addEventListener("click",async()=>{closeSheet();toast("Wird übernommen …");
+    sh.querySelector("#imp-ok").addEventListener("click",async()=>{closeSheet();if(!S.loaded||S.status!=="ok"){toast(NOTLOADED);return}toast("Wird übernommen …");
       const tag=String(data.exportiert||"");const idMap=new Map;for(const o of orte)idMap.set(String(o.id),await tagId("imp-ort:"+tag+":"+o.id));
       const byId=new Map(orte.map(o=>[String(o.id),o]));const depth=o=>{let d=0,c=o;while(c&&c.parentId&&byId.has(String(c.parentId))&&d<6){c=byId.get(String(c.parentId));d++}return d};
       for(let lv=0;lv<=6;lv++){const lvl=orte.filter(o=>depth(o)===lv);if(!lvl.length)continue;const jobsO=[];
         for(const o of lvl){const name=String(o.name||"").slice(0,80)||"Ohne Namen",pid=idMap.get(String(o.parentId||""))||"";
           const same=childrenOf(pid).find(([id,x])=>norm(x.name)===norm(name));if(same){idMap.set(String(o.id),same[0]);continue}
-          jobsO.push(putRow(idMap.get(String(o.id)),{t:"ort",name,parentId:pid,sort:Number(o.sort)||0}))}
+          const nid=idMap.get(String(o.id));if(S.rows.has(nid)||PEND.has(nid))continue;
+          const row={t:"ort",name,parentId:pid,sort:Number(o.sort)||0};jobsO.push(putRow(nid,row,{patch:row,keep:true}))}
         const r=await Promise.all(jobsO);
         if(!r.every(Boolean)){toast("Import abgebrochen: nicht alle Orte gespeichert. Nochmals importieren.");return}}
       const jobs=[];
-      for(const b of boxen){const nr=parseNr(String(b.nr));if(!nr)continue;const cur=S.boxen.get(nr);const mapped=idMap.get(String(b.ortId||""))||"";
-        jobs.push(saveBox(nr,{name:cur?.name||String(b.name||"").slice(0,80),ortId:cur?.ortId&&S.orte.has(cur.ortId)?cur.ortId:mapped}))}
+      for(const b of boxen){const nr=parseNr(String(b.nr));if(!nr)continue;const cur=S.boxen.get(nr);const mapped=idMap.get(String(b.ortId||""))||"";const name=String(b.name||"").slice(0,80);
+        if(!cur){jobs.push(saveBox(nr,{name,ortId:mapped},{keep:true}));continue}
+        const p={};if(!cur.name&&name)p.name=name;if(!(cur.ortId&&S.orte.has(cur.ortId))&&mapped)p.ortId=mapped;if(Object.keys(p).length)jobs.push(saveBox(nr,p))}
       const have=new Set([...S.artikel.values()].map(a=>a.boxNr+"|"+norm(a.name)));
-      for(const [i,a] of artikel.entries()){const nr=parseNr(String(a.boxNr));if(!nr||!a.name||have.has(nr+"|"+norm(String(a.name).slice(0,120))))continue;const id=await tagId("imp-art:"+tag+":"+i);
-        jobs.push(putRow(id,{t:"artikel",boxNr:nr,name:String(a.name).slice(0,120),menge:Math.max(0,parseInt(a.menge,10)||1),erstellt:new Date().toISOString()}))}
-      if(data.meta&&(data.meta.bisNr||0)>(S.meta.bisNr||0))jobs.push((async()=>putRow(S.metaId||await tagId("meta:etiketten"),{t:"meta",bisNr:parseInt(data.meta.bisNr,10)||0,freiAb:parseInt(data.meta.freiAb,10)||1,zeit:new Date().toISOString()}))());
+      for(const [i,a] of artikel.entries()){const nr=parseNr(String(a.boxNr));if(!nr||!a.name||have.has(nr+"|"+norm(String(a.name).slice(0,120))))continue;const id=await tagId("imp-art:"+tag+":"+i);if(S.rows.has(id)||PEND.has(id))continue;
+        const m=parseInt(a.menge,10);const row={t:"artikel",boxNr:nr,name:String(a.name).slice(0,120),menge:Number.isNaN(m)?1:Math.min(9999,Math.max(0,m)),erstellt:new Date().toISOString()};
+        jobs.push(putRow(id,row,{patch:row,keep:true}))}
+      if(data.meta&&(data.meta.bisNr||0)>(S.meta.bisNr||0))jobs.push((async()=>{const mp={t:"meta",bisNr:parseInt(data.meta.bisNr,10)||0,freiAb:parseInt(data.meta.freiAb,10)||1,zeit:new Date().toISOString()};return putRow(S.metaId||await tagId("meta:etiketten"),mp,{patch:mp})})());
       const res=await Promise.all(jobs);toast(res.every(Boolean)?"Sicherung übernommen.":"Einiges konnte nicht gespeichert werden. Nochmals importieren.")})})}
 
 /* ---------- Fenster ---------- */
@@ -421,7 +461,7 @@ function helpSheet(){const inApp=S.phase==="app";
   <li><div><b>Standort und Inhalt</b><span>Antippen, wo die Box steht, Bezeichnung und Inhalt eintippen. Gespeichert wird sofort.</span></div></li></ol>
   <div class="warn small"><b>Privat:</b> Boxnummern, Bezeichnungen, Räume, Inhalte und Fotos werden auf dem Gerät verschlüsselt, bevor sie gespeichert werden. Die Datenbank sieht nur, wie viele Einträge es gibt und wann sie geändert wurden.</div>
   <div><div class="st-row"><span>Angemeldet</span><span>${esc(S.user?.email||"–")}</span></div><div class="st-row"><span>Verbindung</span><span class="st ${S.status==="ok"?"ok":"bad"}">${S.status==="ok"?"verbunden":"getrennt"}</span></div></div>
-  <div class="row">${inApp?`<button class="btn ghost sm" data-act="export">Sicherung herunterladen</button><label class="btn ghost sm" for="importIn" role="button" tabindex="0">Sicherung importieren</label><button class="btn ghost sm" data-act="pw">Login-Passwort ändern</button>`:""}
+  <div class="row">${inApp&&S.loaded?`<button class="btn ghost sm" data-act="export">Sicherung herunterladen</button><label class="btn ghost sm" for="importIn" role="button" tabindex="0">Sicherung importieren</label><button class="btn ghost sm" data-act="pw">Login-Passwort ändern</button>`:""}
     ${S.user?`<button class="btn ghost sm" data-act="forget">Schlüssel auf diesem Gerät löschen</button><button class="btn ghost sm" data-act="logout">Abmelden</button>`:""}</div>
   <div class="foot"><button type="button" class="btn" data-close>Schliessen</button></div>`)}
 function pwSheet(){openSheet(`<span class="eyebrow">Konto</span><h3>Login-Passwort ändern</h3><form id="pwform" novalidate><div class="fld"><label for="pw-1">Neues Passwort</label><input id="pw-1" type="password" autocomplete="new-password" minlength="12"></div><div class="fld"><label for="pw-2">Nochmals</label><input id="pw-2" type="password" autocomplete="new-password"></div><p class="err" id="pw-err"></p>
@@ -437,45 +477,61 @@ async function afterLogin(){S.phase="start";S.gateMsg="";render();
     const saved=await idbGet("keys:"+S.user.id);
     if(!krow){const {data:any,error:e3}=await sb.from("daten").select("id").neq("id",KEY_ID).limit(1);if(e3)throw e3;
       if(any&&any.length){/* Daten vorhanden, aber Schlüsselinfo fehlt: nie neu einrichten */
-        if(saved?.info&&await checkWith(saved.info,saved.aes)){K.aes=saved.aes;K.hmac=saved.hmac;const {error:e4}=await sb.from("daten").insert({id:KEY_ID,blob:JSON.stringify(saved.info)});if(e4)throw e4;S.keyInfo=saved.info;lsSet("kb-keyinfo",saved.info);await loadAll();return}
+        if(saved?.info&&await checkWith(saved.info,saved.aes)){K.aes=saved.aes;K.hmac=saved.hmac;const {error:e4}=await sb.from("daten").insert({id:KEY_ID,blob:JSON.stringify(saved.info)});if(e4)throw e4;S.keyInfo=saved.info;lsSet("kb-keyinfo",saved.info);await resync(false);return}
+        const li=lsGet("kb-keyinfo");if(li&&li.salt&&li.check){try{clampIter(li.iter);S.keyInfo=li;S.restoreKey=true;K.aes=K.hmac=null;S.phase="unlock";S.focusId="ul-pw";render();return}catch(e){}}
         S.phase="error";S.gateMsg="Die Schlüsselinfo in der Datenbank fehlt. Auf einem Gerät öffnen, das schon entsperrt war, dann wird sie wiederhergestellt.";render();return}
       S.phase="setup";S.setupCode=null;S.setupOwn=false;S.focusId="su-2";render();return}
-    S.keyInfo=JSON.parse(krow.blob);clampIter(S.keyInfo.iter);lsSet("kb-keyinfo",S.keyInfo);
-    if(saved&&saved.salt===S.keyInfo.salt){K.aes=saved.aes;K.hmac=saved.hmac;if(await checkKey()){await loadAll();return}}
+    S.restoreKey=false;S.keyInfo=JSON.parse(krow.blob);clampIter(S.keyInfo.iter);lsSet("kb-keyinfo",S.keyInfo);
+    if(saved&&saved.salt===S.keyInfo.salt){K.aes=saved.aes;K.hmac=saved.hmac;if(await checkKey()){await resync(false);return}}
     K.aes=K.hmac=null;S.phase="unlock";S.focusId="ul-pw";render()}
   catch(e){S.phase="error";S.gateMsg=errText(e);render()}}
 async function doLogin(email,pw){S.gateEmail=String(email||"").trim();
   if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(S.gateEmail)){gateErr("Bitte die E-Mail-Adresse eingeben.");return}if(!pw){gateErr("Passwort eingeben.");return}
+  if(looksLikeCode(pw)){gateErr("Das sieht aus wie der Haushalts-Schlüssel, nicht wie das Login-Passwort. Es wurde nichts gesendet.");$("#lg-pw").value="";return}
   setBusy(true,"Meldet an …");
   const info=lsGet("kb-keyinfo");if(info){try{if(await tryPass(pw,info)){gateErr("Das ist der Haushalts-Schlüssel, nicht das Login-Passwort. Es wurde nichts gesendet.");$("#lg-pw").value="";return}}catch(e){}}
   const {data,error}=await sb.auth.signInWithPassword({email:S.gateEmail,password:pw});
   if(error){gateErr(isNet(error)?"Keine Verbindung.":"E-Mail oder Passwort stimmt nicht.");$("#lg-pw")?.select();return}
-  S.busy=false;S.user=data.user;afterLogin()}
+  S.busy=false;S.user=data.user;S.pwDig=await pwDigest(data.user.id,pw);afterLogin()}
+const looksLikeCode=p=>{const s=String(p||"").trim();return /^[A-Za-z2-9]{4}([\s-]?[A-Za-z2-9]{4}){4}$/.test(s)&&[...s.toUpperCase().replace(/[\s-]/g,"")].every(c=>CODE_ABC.includes(c))};
+async function pwDigest(uid,pw){return hex(await crypto.subtle.digest("SHA-256",TE.encode("kb-pw\n"+uid+"\n"+String(pw).normalize("NFC"))))}
 const BAD_WORDS=["keller","box","passwort","password","schlussel","123456","qwertz"];
 async function doSetup(){let pass,kind;
   if(S.setupOwn){const p1=$("#su-1").value,p2=$("#su-2").value;const n=p1.normalize("NFC");
     if(n.length<20){gateErr("Mindestens 20 Zeichen.");return}if(p1!==p2){gateErr("Die beiden Eingaben sind nicht gleich.");return}
     if(BAD_WORDS.some(w=>norm(n).includes(w))||(S.user?.email&&norm(n).includes(norm(S.user.email.split("@")[0])))){gateErr("Bitte keine Namen, Orte oder Wörter wie «Keller» verwenden.");return}
-    if(new Set(n).size<8){gateErr("Zu einfach. Mehr verschiedene Zeichen verwenden.");return}pass=n;kind="eigen"}
+    if(new Set(n).size<10||/(.{4,})\1/.test(n)||/0123|1234|2345|3456|4567|5678|6789|abcd|bcde|cdef|qwer|asdf|yxcv/i.test(n)){gateErr("Zu einfach. Mehr verschiedene Zeichen, keine Wiederholungen oder Folgen wie 1234.");return}
+    if(S.pwDig&&S.user&&(await pwDigest(S.user.id,p1)===S.pwDig||await pwDigest(S.user.id,n)===S.pwDig)){gateErr("Das ist das Login-Passwort. Der Haushalts-Schlüssel muss ein anderer sein.");return}
+    if(!$("#su-notpw").checked){gateErr("Bitte bestätigen, dass der Schlüssel nicht das Login-Passwort ist.");return}
+    if(looksLikeCode(n)){gateErr("Für die Code-Form bitte den erzeugten Code nehmen.");return}pass=n;kind="eigen"}
   else{const c=canonCode($("#su-2").value);if(!c||c!==S.setupCode){gateErr("Der eingegebene Code stimmt nicht mit dem angezeigten überein.");return}pass=c;kind="code"}
   setBusy(true,"Wird eingerichtet …");S.gateMsg="";
   try{const salt=b64(crypto.getRandomValues(new Uint8Array(16)));const keys=await deriveKeys(pass,salt,ITER);K.aes=keys.aes;K.hmac=keys.hmac;
-    const check=b64(await sealBytes(TE.encode("kellerboxen-ok"),"check:"+KEY_ID));const info={v:KEY_V,kind,salt,iter:ITER,check};
+    const check=b64(await sealBytes(TE.encode("kellerboxen-ok"),"check:"+KEY_ID));let info={v:KEY_V,kind,salt,iter:ITER,check};
     const {error}=await sb.from("daten").insert({id:KEY_ID,blob:JSON.stringify(info)});
-    if(error){if(String(error.code)==="23505"){S.busy=false;K.aes=K.hmac=null;await afterLogin();S.gateMsg="Der Schlüssel wurde inzwischen auf einem anderen Gerät festgelegt. Bitte diesen eingeben.";render();return}throw error}
-    S.keyInfo=info;lsSet("kb-keyinfo",info);await idbSet("keys:"+S.user.id,{aes:K.aes,hmac:K.hmac,salt,info});S.busy=false;S.setupCode=null;await loadAll()}
+    if(error){/* Antwort verloren oder anderes Gerät war schneller: nachsehen, was gespeichert ist */
+      const {data:krow,error:e2}=await sb.from("daten").select("blob").eq("id",KEY_ID).maybeSingle();if(e2||!krow)throw error;
+      const ex=JSON.parse(krow.blob);
+      if(ex.salt!==salt){const k2=await tryPass(pass,ex).catch(()=>null);
+        if(!k2){S.busy=false;K.aes=K.hmac=null;await afterLogin();S.gateMsg="Der Schlüssel wurde inzwischen auf einem anderen Gerät festgelegt. Bitte diesen eingeben.";render();return}
+        K.aes=k2.aes;K.hmac=k2.hmac;info=ex}}
+    S.keyInfo=info;lsSet("kb-keyinfo",info);await idbSet("keys:"+S.user.id,{aes:K.aes,hmac:K.hmac,salt:info.salt,info});S.busy=false;S.setupCode=null;S.pwDig=null;await resync(false)}
   catch(e){K.aes=K.hmac=null;gateErr(errText(e))}}
 async function doUnlock(p){if(!p){gateErr("Schlüssel eingeben.");return}if(S.keyInfo.kind==="code"&&!canonCode(p)){gateErr("Der Code hat 20 Zeichen, z. B. ABCD-EFGH-JKLM-NPQR-STUV.");return}
   setBusy(true,"Prüft …");S.gateMsg="";
   try{const keys=await tryPass(p,S.keyInfo);if(!keys){gateErr("Der Schlüssel stimmt nicht.");$("#ul-pw")?.select();return}
-    K.aes=keys.aes;K.hmac=keys.hmac;await idbSet("keys:"+S.user.id,{aes:K.aes,hmac:K.hmac,salt:S.keyInfo.salt,info:S.keyInfo});S.busy=false;await loadAll()}
+    if(S.restoreKey){const {data:one,error:e1}=await sb.from("daten").select("id,blob").neq("id",KEY_ID).limit(1);if(e1)throw e1;
+      if(one&&one[0]){try{await unseal(one[0].blob,one[0].id,keys.aes)}catch(e){gateErr("Dieser Schlüssel passt nicht zu den gespeicherten Daten.");return}}
+      const {error:e2}=await sb.from("daten").insert({id:KEY_ID,blob:JSON.stringify(S.keyInfo)});S.restoreKey=false;
+      if(e2){if(String(e2.code)==="23505"){S.busy=false;await afterLogin();return}throw e2}}
+    K.aes=keys.aes;K.hmac=keys.hmac;await idbSet("keys:"+S.user.id,{aes:K.aes,hmac:K.hmac,salt:S.keyInfo.salt,info:S.keyInfo});S.busy=false;await resync(false)}
   catch(e){K.aes=K.hmac=null;gateErr(errText(e))}}
-async function logout(){closeSheet();try{S.chan&&sb.removeChannel(S.chan)}catch(e){}S.chan=null;if(S.user)await idbDel("keys:"+S.user.id);
-  K.aes=K.hmac=null;S.rows=new Map;CONF.clear();TOUCH.clear();rebuild();S.loaded=false;S.user=null;fotoCache.clear();try{await sb.auth.signOut()}catch(e){}S.phase="login";S.gateMsg="";render()}
+async function logout(){closeSheet();const uid=S.user?.id;resetData();S.pwDig=null;S.restoreKey=false;if(uid)await idbDel("keys:"+uid);
+  S.user=null;try{await sb.auth.signOut()}catch(e){}S.phase="login";S.gateMsg="";render()}
 
 /* ---------- Navigation und Ereignisse ---------- */
 function go(v){if(S.view!=="box")S.lastView=S.view;S.view=v;S.armed=null;window.scrollTo(0,0);render()}
-function openBox(nr,flash){if(S.view!=="box")S.lastView=S.view;S.view="box";S.boxNr=nr;S.addDraft="";S.pickOpen=false;S.pickAdd=null;S.itemEdit=null;S.armed=null;if(flash)S.flashId=flash;S.q="";$("#q").value="";window.scrollTo(0,0);render()}
+function openBox(nr,flash){if(S.view!=="box")S.lastView=S.view;S.view="box";S.boxNr=nr;S.addDraft=DRAFTS.get(nr)||"";S.pickOpen=false;S.pickAdd=null;S.itemEdit=null;S.armed=null;if(flash)S.flashId=flash;S.q="";$("#q").value="";window.scrollTo(0,0);render()}
 let armT;function arm(key){S.armed=key;clearTimeout(armT);armT=setTimeout(()=>{if(S.armed===key){S.armed=null;render()}},4000);render()}
 function pickSet(l,id){const nr=S.boxNr,b=S.boxen.get(nr);const path=ortPath(b?.ortId).map(x=>x[0]);const ortId=path[l]===id?(l?path[l-1]:""):id;S.pickAdd=null;S.pickOpen=true;saveBox(nr,{ortId})}
 async function pickCreate(){const l=S.pickAdd,nr=S.boxNr;const inp=$("#pk-new");const nm=inp?.value.trim();if(l==null)return;if(!nm){inp?.focus();return}
@@ -491,7 +547,7 @@ document.addEventListener("click",e=>{
   if(d.act==="help"){helpSheet();return}
   if(d.act==="logout"){logout();return}
   if(d.act==="reload"){S.gateMsg="";S.user?afterLogin():boot();return}
-  if(d.act==="forget"){if(S.user)idbDel("keys:"+S.user.id).then(()=>{closeSheet();K.aes=K.hmac=null;S.rows=new Map;rebuild();S.loaded=false;S.phase="unlock";render();toast("Schlüssel auf diesem Gerät gelöscht.")});return}
+  if(d.act==="forget"){if(S.user)idbDel("keys:"+S.user.id).then(()=>{closeSheet();resetData();S.phase=S.keyInfo?"unlock":"start";render();if(!S.keyInfo)afterLogin();toast("Schlüssel auf diesem Gerät gelöscht.")});return}
   if(d.act==="copy-code"){copyCode();return}
   if(d.act==="new-code"){S.setupCode=genCode();S.gateMsg="";render();return}
   if(d.act==="own-on"){S.setupOwn=true;S.gateMsg="";S.focusId="su-1";render();return}
@@ -525,18 +581,21 @@ document.addEventListener("submit",async e=>{const f=e.target;e.preventDefault()
   else if(f.id==="setupform")doSetup();
   else if(f.id==="unlockform")doUnlock($("#ul-pw").value);
   else if(f.id==="pwform"){const p1=$("#pw-1").value,p2=$("#pw-2").value,er=$("#pw-err");if(p1.length<12){er.textContent="Mindestens 12 Zeichen.";return}if(p1!==p2){er.textContent="Die beiden Eingaben sind nicht gleich.";return}
+    if(looksLikeCode(p1)){er.textContent="Das sieht aus wie der Haushalts-Schlüssel. Bitte ein anderes Passwort wählen.";return}
     if(S.keyInfo&&await tryPass(p1,S.keyInfo).catch(()=>null)){er.textContent="Das ist der Haushalts-Schlüssel. Bitte ein anderes Passwort wählen.";return}
     const {error}=await sb.auth.updateUser({password:p1});if(error){er.textContent="Hat nicht geklappt. Bitte nochmals versuchen.";return}closeSheet();toast("Login-Passwort geändert.")}
-  else if(f.id==="addform"&&S.phase==="app"){const i=$("#add");const v=i.value;i.value="";S.addDraft="";const nr=S.boxNr;const failed=await addItems(nr,v.split(/\r?\n|;/).map(parseLine));
+  else if(f.id==="addform"&&S.phase==="app"){const i=$("#add");const v=i.value;i.value="";const nr=S.boxNr;S.addDraft="";DRAFTS.delete(nr);const failed=await addItems(nr,v.split(/\r?\n|;/).map(parseLine));
     if(failed.length)restoreDraft(nr,failed);else $("#add")?.focus()}});
-function restoreDraft(nr,failed){if(S.boxNr!==nr||S.addDraft)return;S.addDraft=failed.map(lineOf).join("; ");const inp=$("#add");if(inp&&!inp.value)inp.value=S.addDraft}
+/* Nicht gespeicherte Eingaben gehen nie verloren: pro Box merken, vor den aktuellen Text setzen */
+function restoreDraft(nr,failed){const add=failed.map(lineOf).join("; ");const cur=(S.boxNr===nr?S.addDraft:DRAFTS.get(nr))||"";const next=cur?add+"; "+cur:add;DRAFTS.set(nr,next);
+  if(S.boxNr===nr){S.addDraft=next;const i=$("#add");if(i)i.value=next}toast("Nicht gespeichert: "+(add.length>60?add.slice(0,57)+" …":add))}
 document.addEventListener("focusout",e=>saveField(e.target));
 document.addEventListener("change",e=>{const t=e.target;if(S.phase!=="app")return;
   if(t.id==="photoIn"){const f=t.files[0];t.value="";handlePhoto(f,S.photoTarget||S.boxNr)}
   else if(t.id==="scanIn"){const f=t.files[0];t.value="";scanFile(f)}
   else if(t.id==="importIn"){const f=t.files[0];t.value="";closeSheet();if(f)importData(f)}});
 let lblT;
-document.addEventListener("input",e=>{const t=e.target;if(t.id==="add"){S.addDraft=t.value;return}if(t.id==="lbl-von"||t.id==="lbl-bis"){const v=parseInt(t.value,10);if(t.id==="lbl-von"){S.lbl.von=v>0?v:null;S.lbl.bis=null}else S.lbl.bis=v>0?v:null;clearTimeout(lblT);lblT=setTimeout(render,450)}});
+document.addEventListener("input",e=>{const t=e.target;if(t.id==="add"){S.addDraft=t.value;DRAFTS.set(S.boxNr,t.value);return}if(t.id==="lbl-von"||t.id==="lbl-bis"){const v=parseInt(t.value,10);if(t.id==="lbl-von"){S.lbl.von=v>0?v:null;S.lbl.bis=null}else S.lbl.bis=v>0?v:null;clearTimeout(lblT);lblT=setTimeout(render,450)}});
 document.addEventListener("keydown",e=>{const t=e.target;
   if(e.key==="Escape"){if(!$("#lightbox").hidden){$("#lightbox").click();return}if($("#ov")){closeSheet();return}if(S.pickAdd!=null){S.pickAdd=null;render()}return}
   if(e.key===" "&&t.matches?.("label[for]")){e.preventDefault();document.getElementById(t.htmlFor)?.click();return}
@@ -552,7 +611,8 @@ $("#qclear").addEventListener("click",()=>{S.q="";$("#q").value="";render();$("#
 function readHash(){const h=String(location.hash||"").replace(/^#/,"");const m=/^box-0*(\d{1,3})$/.exec(h);
   if(m&&+m[1]>=1){S.view="box";S.boxNr=padNr(+m[1])}else if(["suchen","uebersicht","etiketten"].includes(h))S.view=h}
 window.addEventListener("hashchange",()=>{readHash();if(S.phase==="app"){S.q="";$("#q").value=""}render()});
-document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible"&&S.phase==="app"&&Date.now()-S.lastLoad>30000)loadAll(true)});
+document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible"&&S.phase==="app"&&Date.now()-S.lastLoad>30000)resync(true)});
+window.addEventListener("online",()=>{if(S.phase==="app")resync(true)});
 
 /* ---------- Start ---------- */
 let authBound=false;

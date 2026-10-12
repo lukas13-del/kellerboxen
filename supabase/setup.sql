@@ -97,3 +97,11 @@ create policy "fotos loeschen" on storage.objects for delete to authenticated us
 --    insert into public.mitglieder (email) values ('erste@adresse.ch'), ('zweite@adresse.ch')
 --    on conflict do nothing;
 --    select email from public.mitglieder;
+--
+--    Mitglied entfernen: auch das Login-Konto löschen, sonst sieht es weiterhin die Zeitpunkte von Löschungen.
+--
+--    delete from public.mitglieder where lower(email) = lower('adresse@beispiel.ch');
+--    delete from auth.users where lower(email) = lower('adresse@beispiel.ch');
+--
+--    Login-Passwörter nie in der Form XXXX-XXXX-XXXX-XXXX-XXXX wählen: so sieht der Haushalts-Schlüssel aus,
+--    und die App sendet solche Eingaben bewusst nicht ab.

@@ -183,3 +183,5 @@ mark{background:var(--mark);color:inherit;border-radius:2px;padding:0 1px}
 @media (prefers-reduced-motion:reduce){.flash,.spin{animation:none}}
 .vh{position:absolute!important;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
 .codebox{font-family:var(--f-data);font-size:clamp(.9rem,4.4vw,1.15rem);font-weight:500;letter-spacing:.03em;text-align:center;padding:14px 10px;border:1px dashed var(--moss);border-radius:6px;background:var(--moss-soft);color:var(--ink);user-select:all;-webkit-user-select:all;overflow-wrap:normal;word-break:normal}
+.chk{display:flex;gap:10px;align-items:flex-start;color:var(--ink);line-height:1.4}
+.chk input{width:20px;height:20px;flex:none;margin-top:1px;accent-color:var(--moss)}

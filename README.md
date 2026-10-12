@@ -16,6 +16,10 @@ Läuft auf dem iPhone im Browser oder als Symbol auf dem Home-Bildschirm.
 - Zugang haben nur freigeschaltete Konten (Tabelle `mitglieder`), öffentliche Registrierung ist ausgeschaltet.
   Die Schlüsselinfo in der Datenbank kann nicht geändert oder gelöscht werden.
 - Sicherungen («?» › «Sicherung herunterladen») sind ebenfalls verschlüsselt.
+- Die App sendet nie etwas, das wie der Haushalts-Schlüssel aussieht, als Login-Passwort. Ein eigener Schlüssel
+  darf nicht das Login-Passwort sein.
+- Zwei Geräte gleichzeitig: Änderungen werden auf den letzten Stand der Datenbank aufgesetzt, nicht blind
+  überschrieben. Nach jedem Wiederverbinden lädt die App nach.
 - Dieses Repository enthält nur den Programmcode, keine Daten und keine E-Mail-Adressen. Schriften und
   Bibliotheken liegen lokal im Repository, die App lädt nichts von fremden Servern ausser der eigenen Datenbank.
 - **Der Haushalts-Schlüssel lässt sich nicht wiederherstellen.** Als eigenen Eintrag im Passwort-Manager
@@ -27,6 +31,7 @@ Läuft auf dem iPhone im Browser oder als Symbol auf dem Home-Bildschirm.
 2. `supabase/setup.sql` im SQL Editor ausführen.
 3. Die E-Mail-Adressen der Mitglieder separat im SQL Editor freischalten (Befehl steht am Ende von `setup.sql`).
 4. Authentication: neue Registrierungen ausschalten, die Konten mit Passwort anlegen («Auto Confirm User»).
+   Das Login-Passwort darf nicht wie der Haushalts-Schlüssel aussehen (XXXX-XXXX-XXXX-XXXX-XXXX).
 5. Projekt-URL und öffentlichen Schlüssel (publishable / anon key) in `config.js` eintragen und in
    `index.html` bei `connect-src` die genaue Projekt-Adresse einsetzen.
 6. GitHub Pages für den Branch `main` aktivieren.
