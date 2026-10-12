@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="de-CH">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self' https://*.supabase.co wss://*.supabase.co; worker-src 'self' blob:; frame-src 'none'; object-src 'none'; base-uri 'self'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex,nofollow">
+<meta name="theme-color" content="#ECEAE4" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#191917" media="(prefers-color-scheme: dark)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Kellerboxen">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="stylesheet" href="fonts.css">
+<link rel="stylesheet" href="app.css">
+<title>Kellerboxen</title>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="brand">
+      <div><span class="eyebrow status" id="status">Verbinde …</span><h1>Kellerboxen</h1></div>
+      <button class="iconbtn" data-act="help" aria-label="Hilfe und Einstellungen" id="helpbtn">?</button>
+    </div>
+    <div class="searchrow" id="searchrow">
+      <div class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+        <input id="q" type="search" placeholder="Suchen oder Box-Nr." autocomplete="off" enterkeyhint="search" aria-label="Gegenstand suchen oder Boxnummer eingeben"><button class="clear" id="qclear" aria-label="Suche leeren" hidden>×</button></div>
+      <button class="scanbtn" data-act="scan" aria-label="Etikett scannen"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3"/><rect x="8" y="8" width="3" height="3"/><rect x="13" y="8" width="3" height="3"/><rect x="8" y="13" width="3" height="3"/><path d="M13 13h3v3"/></svg><span>Scannen</span></button>
+    </div>
+  </header>
+  <main id="main"><p class="muted" style="margin-top:22px">Lädt …</p></main>
+</div>
+<nav class="bottom" id="nav">
+  <button data-v="suchen"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>Suchen</button>
+  <button data-v="uebersicht"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 21V4h16v17"/><path d="M4 10h16M4 15.5h16"/></svg>Übersicht</button>
+  <button data-v="etiketten"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><path d="M14 14h3v3h-3zM18 18h3v3h-3z"/></svg>Etiketten</button>
+</nav>
+<input id="scanIn" type="file" accept="image/*" capture="environment" hidden>
+<input id="photoIn" type="file" accept="image/*" capture="environment" hidden>
+<input id="importIn" type="file" accept="application/json,.json" hidden>
+<div id="sheetroot"></div>
+<div id="lightbox" hidden></div>
+<script src="config.js"></script>
+<script src="vendor/supabase.js"></script>
+<script src="vendor/qrcode.min.js"></script>
+<script src="vendor/jspdf.umd.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
