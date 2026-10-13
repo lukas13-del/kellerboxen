@@ -30,11 +30,16 @@ Läuft auf dem iPhone im Browser oder als Symbol auf dem Home-Bildschirm.
 1. Supabase-Projekt anlegen (Region Europa, z. B. Zürich oder Frankfurt).
 2. `supabase/setup.sql` im SQL Editor ausführen.
 3. Die E-Mail-Adressen der Mitglieder separat im SQL Editor freischalten (Befehl steht am Ende von `setup.sql`).
-4. Authentication: neue Registrierungen ausschalten, die Konten mit Passwort anlegen («Auto Confirm User»).
+4. Authentication › Sign In / Providers: Registrierung erlaubt lassen, «Confirm email» ausschalten
+   (der Gratis-Mailversand erreicht nur Projektmitglieder). Konten können trotzdem nur für Adressen in
+   `mitglieder` entstehen, dafür sorgt der Trigger `nur_mitglieder` auf `auth.users`.
+   Jedes Mitglied legt sein Konto selbst in der App an («Konto erstellen») und wählt sein Passwort selbst.
    Das Login-Passwort darf nicht wie der Haushalts-Schlüssel aussehen (XXXX-XXXX-XXXX-XXXX-XXXX).
 5. Projekt-URL und öffentlichen Schlüssel (publishable / anon key) in `config.js` eintragen und in
    `index.html` bei `connect-src` die genaue Projekt-Adresse einsetzen.
 6. GitHub Pages für den Branch `main` aktivieren.
+7. Der Wachhalter (`.github/workflows/wachhalten.yml`) fragt alle zwei Tage `wach()` ab, damit das
+   Gratis-Projekt nicht nach 7 Tagen ohne Zugriff pausiert.
 
 Beim ersten Anmelden erzeugt die App den Haushalts-Schlüssel. Danach mit «?» › «Sicherung importieren»
 bestehende Daten übernehmen. Weitere Geräte geben den Schlüssel einmal ein.
