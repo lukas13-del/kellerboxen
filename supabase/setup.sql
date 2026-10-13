@@ -44,6 +44,11 @@ revoke all on function public.nur_mitglieder() from public, anon, authenticated;
 drop trigger if exists nur_mitglieder on auth.users;
 create trigger nur_mitglieder before insert on auth.users for each row execute function public.nur_mitglieder();
 
+-- Für den Wachhalter (GitHub Action): gibt nur 1 zurück, liest keine Daten
+create or replace function public.wach() returns integer language sql stable as $$ select 1 $$;
+revoke all on function public.wach() from public;
+grant execute on function public.wach() to anon, authenticated;
+
 -- 2) Die verschlüsselten Datensätze
 create table if not exists public.daten (
   id text primary key check (char_length(id) between 1 and 80),

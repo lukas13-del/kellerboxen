@@ -1,0 +1,30 @@
+# Hält das Gratis-Projekt bei Supabase wach (es pausiert sonst nach 7 Tagen ohne Zugriff).
+# Fragt nur die Funktion wach() ab, die 1 zurückgibt. Keine Daten, keine Schlüssel ausser dem öffentlichen.
+name: Datenbank wach halten
+on:
+  schedule:
+    - cron: "17 5 */2 * *"
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: write
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Datenbank abfragen
+        run: |
+          cfg=$(curl -fsS "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_SHA}/config.js")
+          url=$(printf '%s\n' "$cfg" | sed -n 's/.*supabaseUrl: *"\([^"]*\)".*/\1/p')
+          key=$(printf '%s\n' "$cfg" | sed -n 's/.*supabaseKey: *"\([^"]*\)".*/\1/p')
+          test -n "$url" && test -n "$key"
+          for i in 1 2 3; do
+            if curl -fsS -X POST "$url/rest/v1/rpc/wach" -H "apikey: $key" -H "Content-Type: application/json" -d '{}'; then echo; exit 0; fi
+            sleep 20
+          done
+          exit 1
+      - name: Zeitplan aktiv halten
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/wachhalten.yml/enable"
