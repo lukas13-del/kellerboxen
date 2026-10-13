@@ -27,6 +27,23 @@ $$;
 revoke all on function public.ist_mitglied() from public, anon;
 grant execute on function public.ist_mitglied() to authenticated;
 
+-- Konten können nur für freigeschaltete Adressen entstehen (Registrierung in der App und im Dashboard)
+create or replace function public.nur_mitglieder()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if not exists (select 1 from public.mitglieder m where lower(m.email) = lower(coalesce(new.email, ''))) then
+    raise exception 'Adresse nicht freigeschaltet';
+  end if;
+  return new;
+end $$;
+revoke all on function public.nur_mitglieder() from public, anon, authenticated;
+drop trigger if exists nur_mitglieder on auth.users;
+create trigger nur_mitglieder before insert on auth.users for each row execute function public.nur_mitglieder();
+
 -- 2) Die verschlüsselten Datensätze
 create table if not exists public.daten (
   id text primary key check (char_length(id) between 1 and 80),

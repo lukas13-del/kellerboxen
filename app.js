@@ -17,7 +17,7 @@ const ICON={pin:svg('<path d="M12 21s7-6.2 7-11.5A7 7 0 0 0 5 9.5C5 14.8 12 21 1
   lock:svg('<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>')};
 const S={phase:"start",user:null,keyInfo:null,rows:new Map,orte:new Map,boxen:new Map,boxIds:new Map,artikel:new Map,meta:{},metaId:null,loaded:false,status:"connecting",
   view:"suchen",lastView:"suchen",boxNr:null,q:"",edit:false,pickOpen:false,pickAdd:null,itemEdit:null,armed:null,flashId:null,focusId:null,
-  lbl:{von:null,bis:null,start:null},photoTarget:null,chan:null,lastLoad:0,bad:0,gateMsg:"",gateEmail:"",busy:false,setupCode:null,setupOwn:false,addDraft:""};
+  lbl:{von:null,bis:null,start:null},photoTarget:null,chan:null,lastLoad:0,bad:0,gateMsg:"",gateEmail:"",busy:false,setupCode:null,setupOwn:false,addDraft:"",signup:false};
 
 const $=s=>document.querySelector(s);
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -214,11 +214,19 @@ const VH=`<input type="text" class="vh" autocomplete="username" value="Kellerbox
 function viewGate(){const msg=`<p class="err"${S.gateMsg?' role="alert"':""}>${esc(S.gateMsg)}</p>`;
   if(S.phase==="config")return `<section class="gatecard"><h2 class="h">Noch nicht eingerichtet</h2><p class="muted">Die App ist noch nicht mit der Datenbank verbunden. Die Adresse und den öffentlichen Schlüssel in <code>config.js</code> eintragen.</p></section>`;
   if(S.phase==="start")return `<p class="muted" style="margin-top:22px"><span class="spin"></span> Lädt …</p>`;
+  if(S.phase==="login"&&S.signup)return `<section class="gatecard"><span class="eyebrow">Einmalig</span><h2 class="h">Konto erstellen</h2>
+    <form id="signupform" novalidate><div class="fld"><label for="sg-mail">E-Mail</label><input id="sg-mail" type="email" autocomplete="username" inputmode="email" value="${esc(S.gateEmail)}" required></div>
+    <div class="fld"><label for="sg-pw">Login-Passwort wählen (mindestens 10 Zeichen)</label><input id="sg-pw" type="password" autocomplete="new-password" minlength="10" required></div>
+    <div class="fld"><label for="sg-pw2">Nochmals</label><input id="sg-pw2" type="password" autocomplete="new-password" required></div>${msg}
+    <button class="btn big">Konto erstellen</button></form>
+    <p class="muted small">Nur freigeschaltete Adressen können ein Konto erstellen. Das Login-Passwort ist etwas anderes als der Haushalts-Schlüssel.</p>
+    <div><button type="button" class="linkbtn" data-act="to-login">Ich habe schon ein Konto</button></div></section>`;
   if(S.phase==="login")return `<section class="gatecard"><span class="eyebrow">Anmelden</span><h2 class="h">Willkommen</h2>
     <form id="loginform" novalidate><div class="fld"><label for="lg-mail">E-Mail</label><input id="lg-mail" type="email" autocomplete="username" inputmode="email" value="${esc(S.gateEmail)}" required></div>
     <div class="fld"><label for="lg-pw">Passwort</label><input id="lg-pw" type="password" autocomplete="current-password" required></div>${msg}
     <button class="btn big">Anmelden</button></form>
-    <p class="muted small">Nur freigeschaltete Konten können sich anmelden. Hier das Login-Passwort eingeben, nicht den Haushalts-Schlüssel.</p></section>`;
+    <p class="muted small">Hier das Login-Passwort eingeben, nicht den Haushalts-Schlüssel. Passwort vergessen: Ein Verwalter kann es zurücksetzen.</p>
+    <div><button type="button" class="linkbtn" data-act="to-signup">Noch kein Konto? Konto erstellen</button></div></section>`;
   if(S.phase==="denied")return `<section class="gatecard"><h2 class="h">Nicht freigeschaltet</h2><p class="muted">Das Konto ${esc(S.user?.email||"")} hat keinen Zugang zu diesen Boxen. Ein Verwalter kann die Adresse freischalten.</p><div><button class="btn ghost" data-act="logout">Abmelden</button></div></section>`;
   if(S.phase==="setup"){const code=S.setupCode||(S.setupCode=genCode());
     return `<section class="gatecard"><span class="eyebrow">Einmalig</span><h2 class="h">Haushalts-Schlüssel</h2>
@@ -491,8 +499,20 @@ async function doLogin(email,pw){S.gateEmail=String(email||"").trim();
   setBusy(true,"Meldet an …");
   const info=lsGet("kb-keyinfo");if(info){try{if(await tryPass(pw,info)){gateErr("Das ist der Haushalts-Schlüssel, nicht das Login-Passwort. Es wurde nichts gesendet.");$("#lg-pw").value="";return}}catch(e){}}
   const {data,error}=await sb.auth.signInWithPassword({email:S.gateEmail,password:pw});
-  if(error){gateErr(isNet(error)?"Keine Verbindung.":"E-Mail oder Passwort stimmt nicht.");$("#lg-pw")?.select();return}
+  if(error){gateErr(isNet(error)?"Keine Verbindung.":/not confirmed/i.test(error.message||"")?"Diese Adresse ist noch nicht bestätigt.":"E-Mail oder Passwort stimmt nicht.");$("#lg-pw")?.select();return}
   S.busy=false;S.user=data.user;S.pwDig=await pwDigest(data.user.id,pw);afterLogin()}
+async function doSignup(email,pw,pw2){S.gateEmail=String(email||"").trim().toLowerCase();
+  if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(S.gateEmail)){gateErr("Bitte die E-Mail-Adresse eingeben.");return}
+  if(String(pw||"").length<10){gateErr("Das Passwort braucht mindestens 10 Zeichen.");return}if(pw!==pw2){gateErr("Die beiden Passwörter sind nicht gleich.");return}
+  if(looksLikeCode(pw)){gateErr("Das sieht aus wie der Haushalts-Schlüssel. Bitte ein anderes Passwort wählen. Es wurde nichts gesendet.");return}
+  setBusy(true,"Wird erstellt …");
+  const info=lsGet("kb-keyinfo");if(info){try{if(await tryPass(pw,info)){gateErr("Das ist der Haushalts-Schlüssel. Bitte ein anderes Passwort wählen. Es wurde nichts gesendet.");return}}catch(e){}}
+  let res;try{res=await sb.auth.signUp({email:S.gateEmail,password:pw})}catch(e){res={error:e}}
+  const {data,error}=res;
+  if(error){const m=String(error.message||"");
+    gateErr(isNet(error)?"Keine Verbindung.":/already|registered|exists/i.test(m)?"Für diese Adresse gibt es schon ein Konto. Bitte anmelden.":/database error|saving new user|freigeschaltet/i.test(m)?"Diese Adresse ist nicht freigeschaltet.":/password/i.test(m)?"Dieses Passwort wird nicht akzeptiert. Bitte ein längeres wählen.":"Das Konto konnte nicht erstellt werden.");return}
+  if(!data?.session){S.busy=false;S.signup=false;S.gateMsg="Konto erstellt. Bitte die Bestätigung im Mail-Postfach öffnen und dann anmelden.";render();return}
+  S.busy=false;S.signup=false;S.user=data.user;S.pwDig=await pwDigest(data.user.id,pw);afterLogin()}
 const looksLikeCode=p=>{const s=String(p||"").trim();return /^[A-Za-z2-9]{4}([\s-]?[A-Za-z2-9]{4}){4}$/.test(s)&&[...s.toUpperCase().replace(/[\s-]/g,"")].every(c=>CODE_ABC.includes(c))};
 async function pwDigest(uid,pw){return hex(await crypto.subtle.digest("SHA-256",TE.encode("kb-pw\n"+uid+"\n"+String(pw).normalize("NFC"))))}
 const BAD_WORDS=["keller","box","passwort","password","schlussel","123456","qwertz"];
@@ -527,7 +547,7 @@ async function doUnlock(p){if(!p){gateErr("Schlüssel eingeben.");return}if(S.ke
     K.aes=keys.aes;K.hmac=keys.hmac;await idbSet("keys:"+S.user.id,{aes:K.aes,hmac:K.hmac,salt:S.keyInfo.salt,info:S.keyInfo});S.busy=false;await resync(false)}
   catch(e){K.aes=K.hmac=null;gateErr(errText(e))}}
 async function logout(){closeSheet();const uid=S.user?.id;resetData();S.pwDig=null;S.restoreKey=false;if(uid)await idbDel("keys:"+uid);
-  S.user=null;try{await sb.auth.signOut()}catch(e){}S.phase="login";S.gateMsg="";render()}
+  S.user=null;S.signup=false;try{await sb.auth.signOut()}catch(e){}S.phase="login";S.gateMsg="";render()}
 
 /* ---------- Navigation und Ereignisse ---------- */
 function go(v){if(S.view!=="box")S.lastView=S.view;S.view=v;S.armed=null;window.scrollTo(0,0);render()}
@@ -548,6 +568,8 @@ document.addEventListener("click",e=>{
   if(d.act==="logout"){logout();return}
   if(d.act==="reload"){S.gateMsg="";S.user?afterLogin():boot();return}
   if(d.act==="forget"){if(S.user)idbDel("keys:"+S.user.id).then(()=>{closeSheet();resetData();S.phase=S.keyInfo?"unlock":"start";render();if(!S.keyInfo)afterLogin();toast("Schlüssel auf diesem Gerät gelöscht.")});return}
+  if(d.act==="to-signup"){S.gateEmail=$("#lg-mail")?.value.trim()||S.gateEmail;S.signup=true;S.gateMsg="";S.focusId=S.gateEmail?"sg-pw":"sg-mail";render();return}
+  if(d.act==="to-login"){S.gateEmail=$("#sg-mail")?.value.trim()||S.gateEmail;S.signup=false;S.gateMsg="";S.focusId=S.gateEmail?"lg-pw":"lg-mail";render();return}
   if(d.act==="copy-code"){copyCode();return}
   if(d.act==="new-code"){S.setupCode=genCode();S.gateMsg="";render();return}
   if(d.act==="own-on"){S.setupOwn=true;S.gateMsg="";S.focusId="su-1";render();return}
@@ -576,8 +598,9 @@ document.addEventListener("click",e=>{
   else if(a==="export"){closeSheet();exportData()}
   else if(a==="pw")pwSheet()});
 document.addEventListener("submit",async e=>{const f=e.target;e.preventDefault();
-  if(S.busy&&/^(loginform|setupform|unlockform)$/.test(f.id))return;
+  if(S.busy&&/^(loginform|signupform|setupform|unlockform)$/.test(f.id))return;
   if(f.id==="loginform")doLogin($("#lg-mail").value,$("#lg-pw").value);
+  else if(f.id==="signupform")doSignup($("#sg-mail").value,$("#sg-pw").value,$("#sg-pw2").value);
   else if(f.id==="setupform")doSetup();
   else if(f.id==="unlockform")doUnlock($("#ul-pw").value);
   else if(f.id==="pwform"){const p1=$("#pw-1").value,p2=$("#pw-2").value,er=$("#pw-err");if(p1.length<12){er.textContent="Mindestens 12 Zeichen.";return}if(p1!==p2){er.textContent="Die beiden Eingaben sind nicht gleich.";return}
