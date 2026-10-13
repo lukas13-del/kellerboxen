@@ -10,14 +10,16 @@ const APP_URL=(CFG.appUrl||(location.origin+location.pathname)).replace(/#.*$/,"
 const SHEET={w:63.5,h:38.1,cols:3,rows:7,left:6.94,top:15.16,px:66.33,py:38.1},PER=21;
 const LEVEL=["Raum","Regal / Schrank","Fach"],NEU=["Neuer Raum","Neues Regal","Neues Fach"],ADD=["+ Raum","+ Regal / Schrank","+ Fach"];
 const PH=["z. B. Keller","z. B. Regal links, Schrank","z. B. Tablar 2, Oben"];
-const KEY_ID="schluessel",KEY_V=2,ITER=1000000,CODE_ABC="23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+const APP_V=4,KEY_ID="schluessel",KEY_V=2,ITER=1000000,LOGIN_ITER=600000,CODE_ABC="23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
 const svg=d=>`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${d}</svg>`;
 const ICON={pin:svg('<path d="M12 21s7-6.2 7-11.5A7 7 0 0 0 5 9.5C5 14.8 12 21 12 21z"/><circle cx="12" cy="9.5" r="2.5"/>'),
   cam:svg('<path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/>'),
   lock:svg('<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>')};
 const S={phase:"start",user:null,keyInfo:null,rows:new Map,orte:new Map,boxen:new Map,boxIds:new Map,artikel:new Map,meta:{},metaId:null,loaded:false,status:"connecting",
   view:"suchen",lastView:"suchen",boxNr:null,q:"",edit:false,pickOpen:false,pickAdd:null,itemEdit:null,armed:null,flashId:null,focusId:null,
-  lbl:{von:null,bis:null,start:null},photoTarget:null,chan:null,lastLoad:0,bad:0,gateMsg:"",gateEmail:"",busy:false,setupCode:null,setupOwn:false,addDraft:"",signup:false};
+  lbl:{von:null,bis:null,start:null},photoTarget:null,chan:null,lastLoad:0,bad:0,gateMsg:"",gateEmail:"",busy:false,setupCode:null,setupOwn:false,addDraft:"",signup:false,lk:null,legacy:false,gateHint:"",devMode:"",wrapFix:false};
+const IOS=/iP(hone|ad|od)/.test(navigator.userAgent)||(navigator.platform==="MacIntel"&&navigator.maxTouchPoints>1);
+const STANDALONE=navigator.standalone===true||(window.matchMedia&&matchMedia("(display-mode: standalone)").matches);
 
 const $=s=>document.querySelector(s);
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -56,13 +58,15 @@ function genCode(){const r=crypto.getRandomValues(new Uint8Array(20));let s="";f
 function canonCode(p){const c=String(p||"").toUpperCase().replace(/[^0-9A-Z]/g,"");return c.length===20?c.match(/.{4}/g).join("-"):null}
 function passFor(p,kind){if(kind==="code"){return canonCode(p)}return String(p||"").normalize("NFC")}
 function clampIter(it){it=Number(it)|0;if(it<200000||it>5000000)throw new Error("Ungültige Schlüsselinfo.");return it}
-async function deriveKeys(pass,saltB64,iter){
+async function deriveMaster(pass,saltB64,iter){
   const base=await crypto.subtle.importKey("raw",TE.encode(pass),"PBKDF2",false,["deriveBits"]);
-  const bits=await crypto.subtle.deriveBits({name:"PBKDF2",hash:"SHA-256",salt:unb64(saltB64),iterations:clampIter(iter)},base,256);
-  const hk=await crypto.subtle.importKey("raw",bits,"HKDF",false,["deriveKey"]);new Uint8Array(bits).fill(0);
+  return new Uint8Array(await crypto.subtle.deriveBits({name:"PBKDF2",hash:"SHA-256",salt:unb64(saltB64),iterations:clampIter(iter)},base,256))}
+async function keysFromMaster(master){
+  const hk=await crypto.subtle.importKey("raw",master,"HKDF",false,["deriveKey"]);
   const aes=await crypto.subtle.deriveKey({name:"HKDF",hash:"SHA-256",salt:new Uint8Array(0),info:TE.encode("kellerboxen aes v2")},hk,{name:"AES-GCM",length:256},false,["encrypt","decrypt"]);
   const hmac=await crypto.subtle.deriveKey({name:"HKDF",hash:"SHA-256",salt:new Uint8Array(0),info:TE.encode("kellerboxen hmac v2")},hk,{name:"HMAC",hash:"SHA-256",length:256},false,["sign"]);
   return {aes,hmac}}
+async function deriveKeys(pass,saltB64,iter){return keysFromMaster(await deriveMaster(pass,saltB64,iter))}
 async function sealBytes(bytes,aad,key=K.aes){const iv=crypto.getRandomValues(new Uint8Array(12));
   const ct=new Uint8Array(await crypto.subtle.encrypt({name:"AES-GCM",iv,additionalData:TE.encode(aad)},key,bytes));
   const out=new Uint8Array(12+ct.length);out.set(iv);out.set(ct,12);return out}
@@ -75,12 +79,62 @@ async function tagId(label){return "r"+hex(await crypto.subtle.sign("HMAC",K.hma
 const randId=()=>"r"+hex(crypto.getRandomValues(new Uint8Array(16)));
 async function checkWith(info,key){try{return TD.decode(await openBytes(unb64(info.check),"check:"+KEY_ID,key))==="kellerboxen-ok"}catch(e){return false}}
 const checkKey=()=>checkWith(S.keyInfo,K.aes);
-async function tryPass(p,info){const pass=passFor(p,info.kind);if(!pass)return null;const keys=await deriveKeys(pass,info.salt,info.iter);return (await checkWith(info,keys.aes))?keys:null}
+async function tryPass(p,info){const pass=passFor(p,info.kind);if(!pass)return null;const master=await deriveMaster(pass,info.salt,info.iter);const keys=await keysFromMaster(master);return (await checkWith(info,keys.aes))?{...keys,master}:null}
+
+/* Anmelden mit einem Passwort: Supabase bekommt nur einen davon abgeleiteten Wert (auth), nie das Passwort.
+   Ein zweiter, getrennt abgeleiteter Schlüssel (wrap) verpackt den Haushalts-Schlüssel pro Person. */
+const b64url=buf=>b64(buf).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
+async function loginKeys(email,pw){
+  const salt=new Uint8Array(await crypto.subtle.digest("SHA-256",TE.encode("kellerboxen-login:"+String(email||"").trim().toLowerCase())));
+  const base=await crypto.subtle.importKey("raw",TE.encode(String(pw||"").normalize("NFC")),"PBKDF2",false,["deriveBits"]);
+  const bits=await crypto.subtle.deriveBits({name:"PBKDF2",hash:"SHA-256",salt,iterations:LOGIN_ITER},base,256);
+  const hk=await crypto.subtle.importKey("raw",bits,"HKDF",false,["deriveBits","deriveKey"]);
+  const auth=await crypto.subtle.deriveBits({name:"HKDF",hash:"SHA-256",salt:new Uint8Array(0),info:TE.encode("kellerboxen login v1")},hk,256);
+  const wrap=await crypto.subtle.deriveKey({name:"HKDF",hash:"SHA-256",salt:new Uint8Array(0),info:TE.encode("kellerboxen wrap v1")},hk,{name:"AES-GCM",length:256},false,["encrypt","decrypt"]);
+  return {auth:"kb1."+b64url(auth),wrap}}
+async function wrapId(uid,slot){return "w"+hex(await crypto.subtle.digest("SHA-256",TE.encode((slot?"kb-wrap-next:":"kb-wrap:")+uid))).slice(0,32)}
+async function writeWrap(uid,master,wrapKey,info,slot){const blob="w1."+b64(await sealBytes(master,"wrap:"+uid+":"+info.salt,wrapKey));
+  const {error}=await sb.from("daten").upsert({id:await wrapId(uid,slot),blob});if(error)throw error}
+async function writeWrapRetry(uid,master,wrapKey,info){for(let i=0;i<3;i++){try{await writeWrap(uid,master,wrapKey,info);return true}catch(e){await new Promise(r=>setTimeout(r,400*(i+1)))}}return false}
+async function delWrap(uid,slot){try{await sb.from("daten").delete().eq("id",await wrapId(uid,slot))}catch(e){}}
+/* {master} | {missing:true} | {bad:true}; wirft nur bei Verbindungsproblemen */
+async function readWrapSlot(uid,wrapKey,info,slot){const {data,error}=await sb.from("daten").select("blob").eq("id",await wrapId(uid,slot)).maybeSingle();if(error)throw error;
+  if(!data||!String(data.blob).startsWith("w1."))return {missing:true};
+  try{return {master:await openBytes(unb64(data.blob.slice(3)),"wrap:"+uid+":"+info.salt,wrapKey)}}catch(e){return {bad:true}}}
+async function readWrap(uid,wrapKey,info){const a=await readWrapSlot(uid,wrapKey,info,0);if(a.master)return a;
+  const b=await readWrapSlot(uid,wrapKey,info,1);
+  if(b.master){/* abgebrochener Passwortwechsel: Zwischenstand übernehmen */try{await writeWrap(uid,b.master,wrapKey,info);await delWrap(uid,1)}catch(e){}return b}
+  return a.missing&&b.missing?{missing:true}:{bad:true}}
+const samePw=e=>!!e&&(e.code==="same_password"||/different from the old password|same password/i.test(e.message||""));
+/* Vor jedem Senden eines Anmeldewerts prüfen, ob diese App-Version noch aktuell ist */
+async function ensureCurrent(){try{const r=await fetch("version.json?t="+Date.now(),{cache:"no-store"});if(r.ok){const v=await r.json();if(Number(v.v)>APP_V){location.reload();return false}}}catch(e){}return true}
+function lev(a,b){if(a===b)return 0;let prev=Array.from({length:b.length+1},(_,i)=>i);for(let i=1;i<=a.length;i++){const cur=[i];for(let j=1;j<=b.length;j++)cur[j]=Math.min(prev[j]+1,cur[j-1]+1,prev[j-1]+(a[i-1]===b[j-1]?0:1));prev=cur}return prev[b.length]}
+function similarPw(a,b){const n=x=>String(x||"").normalize("NFC").toLowerCase().replace(/[\s\p{P}\p{S}]/gu,"");const x=n(a),y=n(b);if(!x||!y)return false;
+  if(x===y||x.includes(y)||y.includes(x))return true;return lev(x,y)<=Math.max(3,Math.floor(Math.max(x.length,y.length)/4))}
+const isMeta=id=>id===KEY_ID||String(id).startsWith("w");
 
 /* Schlüssel auf diesem Gerät (nicht auslesbar, nur verwendbar) */
 function idb(){return new Promise((res,rej)=>{const r=indexedDB.open("kellerboxen",1);r.onupgradeneeded=()=>r.result.createObjectStore("k");r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)})}
-async function idbDo(mode,fn){try{const d=await idb();return await new Promise((res,rej)=>{const tx=d.transaction("k",mode);const rq=fn(tx.objectStore("k"));tx.oncomplete=()=>res(rq?.result);tx.onerror=()=>rej(tx.error)})}catch(e){return null}}
+/* iPhone-Apps auf dem Home-Bildschirm verlieren nach dem Hintergrund manchmal die Speicherverbindung: neu öffnen und nochmals versuchen */
+async function idbDo(mode,fn){for(let i=0;i<3;i++){try{const d=await idb();try{return await new Promise((res,rej)=>{const tx=d.transaction("k",mode);const rq=fn(tx.objectStore("k"));tx.oncomplete=()=>res(rq?.result);tx.onerror=()=>rej(tx.error);tx.onabort=()=>rej(tx.error)})}finally{try{d.close()}catch(e){}}}
+  catch(e){if(e?.name==="DataCloneError")return null;await new Promise(r=>setTimeout(r,150*(i+1)))}}return null}
 const idbGet=k=>idbDo("readonly",s=>s.get(k)),idbSet=(k,v)=>idbDo("readwrite",s=>s.put(v,k)),idbDel=k=>idbDo("readwrite",s=>s.delete(k));
+/* Merkt sich den Schlüssel auf diesem Gerät. Zuerst als nicht auslesbarer Schlüssel; kann der Browser das nicht
+   (manche iPhone-Ansichten), dann als Rohwert. Der Schlüssel verlässt das Gerät nie. */
+async function saveDevice(uid,keys,master,info){
+  if(await idbSet("keys:"+uid,{aes:keys.aes,hmac:keys.hmac,salt:info.salt,info})){const back=await idbGet("keys:"+uid);
+    if(back?.aes&&await checkWith(info,back.aes)){try{localStorage.removeItem("kb-dev:"+uid)}catch(e){}S.devMode="key";return "key"}}
+  if(master){const raw={raw:b64(master),salt:info.salt,info};
+    if(await idbSet("keys:"+uid,raw)&&(await idbGet("keys:"+uid))?.raw===raw.raw){S.devMode="raw";return "raw"}
+    try{localStorage.setItem("kb-dev:"+uid,JSON.stringify(raw));S.devMode="ls";return "ls"}catch(e){}}
+  S.devMode="";return ""}
+async function loadDevice(uid,info){let s=await idbGet("keys:"+uid);if(!s||(!s.aes&&!s.raw))s=lsGet("kb-dev:"+uid);
+  if(!s||s.salt!==info.salt)return null;
+  try{if(s.aes&&await checkWith(info,s.aes)){S.devMode="key";return {aes:s.aes,hmac:s.hmac}}
+    if(s.raw){const m=unb64(s.raw);const k=await keysFromMaster(m);if(await checkWith(info,k.aes)){S.devMode=lsGet("kb-dev:"+uid)?"ls":"raw";return {...k,master:m}}}}catch(e){}
+  return null}
+async function forgetDevice(uid){await idbDel("keys:"+uid);try{localStorage.removeItem("kb-dev:"+uid)}catch(e){}S.devMode=""}
+const askPersist=()=>{try{navigator.storage?.persist?.().catch(()=>{})}catch(e){}};
 /* Öffentliche Schlüsselinfo (Salz, Runden, Prüfwert) lokal merken: schützt davor, den Schlüssel als Login-Passwort zu senden */
 const lsSet=(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}},lsGet=k=>{try{return JSON.parse(localStorage.getItem(k)||"null")}catch(e){return null}};
 
@@ -139,7 +193,7 @@ async function newOrt(parentId,name){const id=randId();const lvl=parentId?Math.m
 async function fetchAll(){const rows=[];let last="";
   for(;;){let q=sb.from("daten").select("id,blob").neq("id",KEY_ID).order("id").limit(1000);if(last)q=q.gt("id",last);
     const {data,error}=await q;if(error)throw error;rows.push(...data);if(data.length<1000)break;last=data[data.length-1].id}
-  const map=new Map;let bad=0;await Promise.all(rows.map(async r=>{try{map.set(r.id,await unseal(r.blob,r.id))}catch(e){bad++}}));return {map,bad}}
+  const map=new Map;let bad=0;await Promise.all(rows.filter(r=>!isMeta(r.id)).map(async r=>{try{map.set(r.id,await unseal(r.blob,r.id))}catch(e){bad++}}));return {map,bad}}
 /* Immer nur ein Ladevorgang gleichzeitig; Anfragen währenddessen lösen danach genau einen weiteren aus */
 let loadP=null,loadAgain=false;
 function resync(quiet=true){if(!quiet&&S.phase!=="app"){S.phase="app";S.status="connecting";render()}if(loadP){loadAgain=true;return loadP}
@@ -152,8 +206,8 @@ async function loadAll(quiet){const gen=GEN;if(!quiet){S.phase="app";S.status="c
     S.rows=map;S.bad=bad;rebuild();S.loaded=true;S.status="ok";S.lastLoad=Date.now();render()}
   catch(e){if(gen!==GEN)return;S.status="bad";S.gateMsg=errText(e);render()}}
 async function handleRT(p){
-  if(p.eventType==="DELETE"){const id=p.old?.id;if(!id||id===KEY_ID)return;confSet(id,undefined);if(PEND.get(id))return;localSet(id,undefined);return}
-  const r=p.new;if(!r||r.id===KEY_ID)return;if(SENT.delete(r.blob))return;
+  if(p.eventType==="DELETE"){const id=p.old?.id;if(!id||isMeta(id))return;confSet(id,undefined);if(PEND.get(id))return;localSet(id,undefined);return}
+  const r=p.new;if(!r||isMeta(r.id))return;if(SENT.delete(r.blob))return;
   const o=await unseal(r.blob,r.id);confSet(r.id,o);if(PEND.get(r.id))return;localSet(r.id,o)}
 function subscribe(){if(S.chan||!sb.channel)return;const gen=GEN;
   const ch=sb.channel("daten-live").on("postgres_changes",{event:"*",schema:"public",table:"daten"},p=>{if(gen===GEN)RTQ=RTQ.then(()=>handleRT(p)).catch(()=>{})});S.chan=ch;
@@ -216,16 +270,17 @@ function viewGate(){const msg=`<p class="err"${S.gateMsg?' role="alert"':""}>${e
   if(S.phase==="start")return `<p class="muted" style="margin-top:22px"><span class="spin"></span> Lädt …</p>`;
   if(S.phase==="login"&&S.signup)return `<section class="gatecard"><span class="eyebrow">Einmalig</span><h2 class="h">Konto erstellen</h2>
     <form id="signupform" novalidate><div class="fld"><label for="sg-mail">E-Mail</label><input id="sg-mail" type="email" autocomplete="username" inputmode="email" value="${esc(S.gateEmail)}" required></div>
-    <div class="fld"><label for="sg-pw">Login-Passwort wählen (mindestens 10 Zeichen)</label><input id="sg-pw" type="password" autocomplete="new-password" minlength="10" required></div>
+    <div class="fld"><label for="sg-pw">Passwort wählen (mindestens 12 Zeichen)</label><input id="sg-pw" type="password" autocomplete="new-password" minlength="12" required></div>
     <div class="fld"><label for="sg-pw2">Nochmals</label><input id="sg-pw2" type="password" autocomplete="new-password" required></div>${msg}
     <button class="btn big">Konto erstellen</button></form>
-    <p class="muted small">Nur freigeschaltete Adressen können ein Konto erstellen. Das Login-Passwort ist etwas anderes als der Haushalts-Schlüssel.</p>
+    <p class="muted small">Nur freigeschaltete Adressen können ein Konto erstellen. ${IOS?"Das iPhone schlägt ein starkes Passwort vor und speichert es, einfach übernehmen.":"Am besten ein vom Passwort-Manager vorgeschlagenes Passwort nehmen."}</p>
     <div><button type="button" class="linkbtn" data-act="to-login">Ich habe schon ein Konto</button></div></section>`;
   if(S.phase==="login")return `<section class="gatecard"><span class="eyebrow">Anmelden</span><h2 class="h">Willkommen</h2>
     <form id="loginform" novalidate><div class="fld"><label for="lg-mail">E-Mail</label><input id="lg-mail" type="email" autocomplete="username" inputmode="email" value="${esc(S.gateEmail)}" required></div>
-    <div class="fld"><label for="lg-pw">Passwort</label><input id="lg-pw" type="password" autocomplete="current-password" required></div>${msg}
+    <div class="fld"><label for="lg-pw">Passwort</label><input id="lg-pw" type="password" autocomplete="current-password" required></div>${S.gateHint&&!S.gateMsg?`<p class="muted small" style="margin:0">${esc(S.gateHint)}</p>`:""}${msg}
     <button class="btn big">Anmelden</button></form>
-    <p class="muted small">Hier das Login-Passwort eingeben, nicht den Haushalts-Schlüssel. Passwort vergessen: Ein Verwalter kann es zurücksetzen.</p>
+    <p class="muted small" style="margin:0">Dein Passwort verlässt dieses Gerät nie.</p>
+    ${homeHint()}<p class="muted small">Passwort vergessen: Ein Verwalter löscht dein Login-Konto, die Daten bleiben. Danach «Konto erstellen» und einmal den Haushalts-Code eingeben.</p>
     <div><button type="button" class="linkbtn" data-act="to-signup">Noch kein Konto? Konto erstellen</button></div></section>`;
   if(S.phase==="denied")return `<section class="gatecard"><h2 class="h">Nicht freigeschaltet</h2><p class="muted">Das Konto ${esc(S.user?.email||"")} hat keinen Zugang zu diesen Boxen. Ein Verwalter kann die Adresse freischalten.</p><div><button class="btn ghost" data-act="logout">Abmelden</button></div></section>`;
   if(S.phase==="setup"){const code=S.setupCode||(S.setupCode=genCode());
@@ -242,12 +297,23 @@ function viewGate(){const msg=`<p class="err"${S.gateMsg?' role="alert"':""}>${e
       <form id="setupform" novalidate>${VH}<div class="fld"><label for="su-2">Zur Kontrolle den Code eingeben oder einfügen</label><input id="su-2" type="text" autocomplete="off" autocapitalize="characters" autocorrect="off" spellcheck="false" required></div>${msg}
       <button class="btn big">Schlüssel festlegen</button></form>
       <button type="button" class="linkbtn" data-act="own-on">Lieber einen eigenen, langen Schlüssel wählen</button>`}</section>`}
-  if(S.phase==="unlock")return `<section class="gatecard"><span class="eyebrow">Entsperren</span><h2 class="h">Haushalts-Schlüssel</h2>
-    <p class="muted">Einmal pro Gerät eingeben. Danach merkt sich dieses Gerät den Schlüssel in nicht auslesbarer Form, der Code selbst wird nicht gespeichert.</p>
+  if(S.phase==="umstellen"){const own=S.keyInfo?.kind==="eigen";return `<section class="gatecard"><span class="eyebrow">Einmalig</span><h2 class="h">Anmeldung vereinfachen</h2>
+    <p class="muted">Ab jetzt reicht dein Passwort, auch auf neuen Geräten. Dafür einmal ein komplett neues Passwort wählen (am besten den Vorschlag des iPhones oder Passwort-Managers) und den Haushalts-Code ein letztes Mal eingeben. Das bisherige Passwort hat die Datenbank schon gesehen, das neue sieht sie nie.</p>
+    <div class="warn small">Vorher die App auf allen anderen Geräten ganz schliessen und neu öffnen. Das neue Passwort nur dort eingeben, wo «Dein Passwort verlässt dieses Gerät nie» steht.</div>
+    <form id="umform" novalidate><input type="text" class="vh" autocomplete="username" value="${esc(S.user?.email||"")}" readonly tabindex="-1" aria-hidden="true">
+    <div class="fld"><label for="um-old">Bisheriges Passwort (bleibt hier, nur zum Vergleich)</label><input id="um-old" type="password" autocomplete="current-password" required></div>
+    <div class="fld"><label for="um-pw">Neues Passwort (mindestens 12 Zeichen)</label><input id="um-pw" type="password" autocomplete="new-password" minlength="12" required></div>
+    <div class="fld"><label for="um-pw2">Nochmals</label><input id="um-pw2" type="password" autocomplete="new-password" required></div>
+    <div class="fld"><label for="um-code">${own?"Haushalts-Schlüssel":"Haushalts-Code"}</label><input id="um-code" type="${own?"password":"text"}" autocomplete="off" autocapitalize="${own?"off":"characters"}" autocorrect="off" spellcheck="false" required></div>${msg}
+    <button class="btn big">Umstellen</button></form></section>`}
+  if(S.phase==="unlock")return `<section class="gatecard"><span class="eyebrow">${S.restoreKey?"Entsperren":"Einmalig"}</span><h2 class="h">Haushalts-Code</h2>
+    <p class="muted">${S.restoreKey?"Einmal pro Gerät eingeben. Danach merkt sich dieses Gerät den Schlüssel.":S.wrapFix?"Einmal bestätigen: Damit auf neuen Geräten dein Passwort genügt, den Haushalts-Code noch einmal eingeben.":"Gib den Code ein, den du bekommen hast. Das ist nur dieses eine Mal nötig: Danach reicht auf jedem Gerät dein Passwort."}</p>
     <form id="unlockform" novalidate>${VH}<div class="fld"><label for="ul-pw">Haushalts-Schlüssel</label><input id="ul-pw" type="password" autocomplete="current-password" autocapitalize="${S.keyInfo?.kind==="code"?"characters":"off"}" spellcheck="false" required></div>${msg}
     <button class="btn big">Entsperren</button></form>
-    <div><button class="linkbtn" data-act="logout">Abmelden</button></div></section>`;
+    <div>${S.wrapFix&&K.aes?`<button class="linkbtn" data-act="fix-later">Später</button>`:`<button class="linkbtn" data-act="logout">Abmelden</button>`}</div></section>`;
   return `<section class="gatecard"><h2 class="h">Das hat nicht geklappt</h2>${msg}<div class="row"><button class="btn" data-act="reload">Nochmals versuchen</button>${S.user?`<button class="btn ghost" data-act="logout">Abmelden</button>`:""}</div></section>`}
+function homeHint(){if(!IOS||STANDALONE||lsGet("kb-hint-home"))return "";
+  return `<div class="warn small" role="note"><b>Tipp fürs iPhone:</b> In Safari auf Teilen › «Zum Home-Bildschirm» tippen und Kellerboxen danach immer über dieses Symbol öffnen. Safari und das Symbol merken sich die Anmeldung getrennt; ein Link aus WhatsApp öffnet Safari. <button class="linkbtn" style="padding:0" data-act="hint-off">Ausblenden</button></div>`}
 function loadingOr(fn){if(!S.loaded)return S.status==="bad"?`<div class="empty"><b>Keine Verbindung</b><span class="muted">${esc(S.gateMsg||"Internet prüfen.")}</span><div><button class="btn sm" data-act="reload">Nochmals laden</button></div></div>`:`<p class="muted" style="margin-top:22px"><span class="spin"></span> Boxen werden geladen …</p>`;
   return (S.bad?`<div class="warn small" style="margin-bottom:10px">${S.bad} Einträge liessen sich nicht entschlüsseln.</div>`:"")+fn()}
 function boxRow(nr,b,count){return `<button class="li" data-open="${esc(nr)}"><span class="bno">${esc(nr)}</span><span class="t"><b>${b.name?esc(b.name):'<span class="muted">Ohne Bezeichnung</span>'}</b><small>${esc(whereText(b))} · ${count} ${count===1?"Gegenstand":"Gegenstände"}</small></span><span class="chev">›</span></button>`}
@@ -259,9 +325,9 @@ function viewHome(){return loadingOr(()=>{
     <ol class="steps"><li><div><b>Etiketten drucken</b><span>Im Reiter «Etiketten» die Nummern wählen, das PDF drucken und die Etiketten auf die Boxen kleben.</span></div></li>
     <li><div><b>Box öffnen</b><span>Die Nummer oben ins Suchfeld tippen oder mit «Scannen» die Kamera aufs Etikett halten.</span></div></li>
     <li><div><b>Standort und Inhalt</b><span>Antippen, wo die Box steht, dann eintippen, was drin ist. Gespeichert wird sofort und verschlüsselt.</span></div></li></ol>
-    <div class="row"><button class="btn" data-open="${nf}">Box ${nf} einrichten</button><button class="btn ghost" data-v="etiketten">Etiketten drucken</button></div></section>`;
+    <div class="row"><button class="btn" data-open="${nf}">Box ${nf} einrichten</button><button class="btn ghost" data-v="etiketten">Etiketten drucken</button></div></section>`+homeHint();
   const cnt=itemCount(),last=lastActivity();const recent=sortedBoxes().sort((x,y)=>(last.get(y[0])||"").localeCompare(last.get(x[0])||"")).slice(0,6);
-  return `<div class="stats"><span><b>${S.boxen.size}</b>${S.boxen.size===1?"Box":"Boxen"}</span><span><b>${S.artikel.size}</b>Gegenstände</span></div>
+  return homeHint()+`<div class="stats"><span><b>${S.boxen.size}</b>${S.boxen.size===1?"Box":"Boxen"}</span><span><b>${S.artikel.size}</b>Gegenstände</span></div>
   <p class="muted small">Nummer oben eintippen oder Etikett scannen. Nächste freie Nummer: <button class="linkbtn" style="padding:0" data-open="${nf}">${nf}</button></p>
   <div class="sec">Zuletzt bearbeitet</div><div class="list">${recent.map(([nr,b])=>boxRow(nr,b,cnt.get(nr)||0)).join("")}</div>
   <button class="linkbtn" data-v="uebersicht" style="margin-top:8px">Alle Boxen nach Standort ›</button>`})}
@@ -468,11 +534,11 @@ function helpSheet(){const inApp=S.phase==="app";
   <li><div><b>Box öffnen</b><span>Nummer oben eintippen, oder «Scannen» antippen und die Kamera aufs Etikett halten.</span></div></li>
   <li><div><b>Standort und Inhalt</b><span>Antippen, wo die Box steht, Bezeichnung und Inhalt eintippen. Gespeichert wird sofort.</span></div></li></ol>
   <div class="warn small"><b>Privat:</b> Boxnummern, Bezeichnungen, Räume, Inhalte und Fotos werden auf dem Gerät verschlüsselt, bevor sie gespeichert werden. Die Datenbank sieht nur, wie viele Einträge es gibt und wann sie geändert wurden.</div>
-  <div><div class="st-row"><span>Angemeldet</span><span>${esc(S.user?.email||"–")}</span></div><div class="st-row"><span>Verbindung</span><span class="st ${S.status==="ok"?"ok":"bad"}">${S.status==="ok"?"verbunden":"getrennt"}</span></div></div>
-  <div class="row">${inApp&&S.loaded?`<button class="btn ghost sm" data-act="export">Sicherung herunterladen</button><label class="btn ghost sm" for="importIn" role="button" tabindex="0">Sicherung importieren</label><button class="btn ghost sm" data-act="pw">Login-Passwort ändern</button>`:""}
+  <div><div class="st-row"><span>Angemeldet</span><span>${esc(S.user?.email||"–")}</span></div><div class="st-row"><span>Verbindung</span><span class="st ${S.status==="ok"?"ok":"bad"}">${S.status==="ok"?"verbunden":"getrennt"}</span></div><div class="st-row"><span>Geöffnet als</span><span>${STANDALONE?"App (Home-Bildschirm)":"Browser"}</span></div><div class="st-row"><span>Dieses Gerät</span><span>${S.devMode==="key"?"merkt sich die Anmeldung":S.devMode?"merkt sich die Anmeldung (einfacher Speicher)":"merkt sich nichts"}</span></div></div>
+  <div class="row">${inApp&&S.loaded?`<button class="btn ghost sm" data-act="export">Sicherung herunterladen</button><label class="btn ghost sm" for="importIn" role="button" tabindex="0">Sicherung importieren</label><button class="btn ghost sm" data-act="pw">Passwort ändern</button>`:""}
     ${S.user?`<button class="btn ghost sm" data-act="forget">Schlüssel auf diesem Gerät löschen</button><button class="btn ghost sm" data-act="logout">Abmelden</button>`:""}</div>
   <div class="foot"><button type="button" class="btn" data-close>Schliessen</button></div>`)}
-function pwSheet(){openSheet(`<span class="eyebrow">Konto</span><h3>Login-Passwort ändern</h3><form id="pwform" novalidate><div class="fld"><label for="pw-1">Neues Passwort</label><input id="pw-1" type="password" autocomplete="new-password" minlength="12"></div><div class="fld"><label for="pw-2">Nochmals</label><input id="pw-2" type="password" autocomplete="new-password"></div><p class="err" id="pw-err"></p>
+function pwSheet(){openSheet(`<span class="eyebrow">Konto</span><h3>Passwort ändern</h3><form id="pwform" novalidate><input type="text" class="vh" autocomplete="username" value="${esc(S.user?.email||"")}" readonly tabindex="-1" aria-hidden="true"><div class="fld"><label for="pw-0">Bisheriges Passwort</label><input id="pw-0" type="password" autocomplete="current-password"></div><div class="fld"><label for="pw-1">Neues Passwort (mindestens 12 Zeichen)</label><input id="pw-1" type="password" autocomplete="new-password" minlength="12"></div><div class="fld"><label for="pw-2">Nochmals</label><input id="pw-2" type="password" autocomplete="new-password"></div><p class="err" id="pw-err"></p>
   <div class="foot"><button type="button" class="btn ghost" data-close>Abbrechen</button><button class="btn">Speichern</button></div></form>`)}
 function zoom(path){const lb=$("#lightbox");lb.innerHTML=`<img alt="Foto der Box">`;lb.hidden=false;lb.onclick=()=>{lb.hidden=true;lb.innerHTML=""};fotoUrl(path).then(u=>{const im=lb.querySelector("img");if(im)im.src=u}).catch(()=>{})}
 
@@ -481,38 +547,77 @@ function gateErr(msg){S.gateMsg=msg;const el=document.querySelector(".gatecard .
 function setBusy(b,label){S.busy=b;const btn=document.querySelector(".gatecard form .btn.big");if(!btn)return;if(b){btn.dataset.label=btn.dataset.label||btn.textContent;btn.textContent=label||"Bitte warten …";btn.disabled=true}else{if(btn.dataset.label)btn.textContent=btn.dataset.label;btn.disabled=false}}
 async function afterLogin(){S.phase="start";S.gateMsg="";render();
   try{const {data:ok,error}=await sb.rpc("ist_mitglied");if(error)throw error;if(!ok){S.phase="denied";render();return}
+    try{const {data:gu}=await sb.auth.getUser();if(gu?.user)S.user=gu.user}catch(e){}
+    S.legacy=!(Number(S.user?.user_metadata?.kb_login)>=1);
     const {data:krow,error:e2}=await sb.from("daten").select("blob").eq("id",KEY_ID).maybeSingle();if(e2)throw e2;
-    const saved=await idbGet("keys:"+S.user.id);
+    const uid=S.user.id;
     if(!krow){const {data:any,error:e3}=await sb.from("daten").select("id").neq("id",KEY_ID).limit(1);if(e3)throw e3;
       if(any&&any.length){/* Daten vorhanden, aber Schlüsselinfo fehlt: nie neu einrichten */
-        if(saved?.info&&await checkWith(saved.info,saved.aes)){K.aes=saved.aes;K.hmac=saved.hmac;const {error:e4}=await sb.from("daten").insert({id:KEY_ID,blob:JSON.stringify(saved.info)});if(e4)throw e4;S.keyInfo=saved.info;lsSet("kb-keyinfo",saved.info);await resync(false);return}
+        const saved=await idbGet("keys:"+uid);const dev=saved?.info?await loadDevice(uid,saved.info):null;
+        if(dev){K.aes=dev.aes;K.hmac=dev.hmac;const {error:e4}=await sb.from("daten").insert({id:KEY_ID,blob:JSON.stringify(saved.info)});if(e4)throw e4;S.keyInfo=saved.info;lsSet("kb-keyinfo",saved.info);await resync(false);return}
         const li=lsGet("kb-keyinfo");if(li&&li.salt&&li.check){try{clampIter(li.iter);S.keyInfo=li;S.restoreKey=true;K.aes=K.hmac=null;S.phase="unlock";S.focusId="ul-pw";render();return}catch(e){}}
         S.phase="error";S.gateMsg="Die Schlüsselinfo in der Datenbank fehlt. Auf einem Gerät öffnen, das schon entsperrt war, dann wird sie wiederhergestellt.";render();return}
+      if(!S.lk&&!S.legacy){/* Einrichten nur mit eingegebenem Passwort, damit der Schlüssel dafür hinterlegt wird */
+        S.gateEmail=S.user.email||S.gateEmail;S.gateHint="Zum Einrichten dein Passwort eingeben.";S.signup=false;S.phase="login";S.focusId="lg-pw";render();return}
       S.phase="setup";S.setupCode=null;S.setupOwn=false;S.focusId="su-2";render();return}
     S.restoreKey=false;S.keyInfo=JSON.parse(krow.blob);clampIter(S.keyInfo.iter);lsSet("kb-keyinfo",S.keyInfo);
-    if(saved&&saved.salt===S.keyInfo.salt){K.aes=saved.aes;K.hmac=saved.hmac;if(await checkKey()){await resync(false);return}}
-    K.aes=K.hmac=null;S.phase="unlock";S.focusId="ul-pw";render()}
+    const dev=await loadDevice(uid,S.keyInfo);
+    if(dev){K.aes=dev.aes;K.hmac=dev.hmac;askPersist();
+      if(S.legacy){S.lk=null;S.phase="umstellen";S.focusId="um-old";render();return}
+      if(S.lk){/* fehlt der hinterlegte Schlüssel fürs Passwort? Dann jetzt nachholen */
+        let w=null;try{w=await readWrap(uid,S.lk.wrap,S.keyInfo)}catch(e){}
+        if(w&&!w.master){if(dev.master&&await writeWrapRetry(uid,dev.master,S.lk.wrap,S.keyInfo)){S.lk=null}
+          else{S.wrapFix=true;S.phase="unlock";S.focusId="ul-pw";render();return}}}
+      S.lk=null;await resync(false);return}
+    K.aes=K.hmac=null;
+    if(S.lk){/* soeben mit Passwort angemeldet: verpackten Haushalts-Schlüssel öffnen */
+      let m=null;try{m=(await readWrap(uid,S.lk.wrap,S.keyInfo)).master||null}catch(e){if(isNet(e))throw e}
+      if(m){const k=await keysFromMaster(m);if(await checkWith(S.keyInfo,k.aes)){K.aes=k.aes;K.hmac=k.hmac;await saveDevice(uid,k,m,S.keyInfo);askPersist();S.lk=null;await resync(false);return}}
+      S.phase="unlock";S.focusId="ul-pw";render();return}
+    if(S.legacy){S.phase="umstellen";S.focusId="um-old";render();return}
+    /* Sitzung vorhanden, aber dieses Gerät kennt den Schlüssel nicht: das Passwort genügt */
+    S.gateEmail=S.user.email||S.gateEmail;S.gateHint="Zum Entsperren dieses Geräts dein Passwort eingeben.";S.signup=false;S.phase="login";S.focusId="lg-pw";render()}
   catch(e){S.phase="error";S.gateMsg=errText(e);render()}}
 async function doLogin(email,pw){S.gateEmail=String(email||"").trim();
   if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(S.gateEmail)){gateErr("Bitte die E-Mail-Adresse eingeben.");return}if(!pw){gateErr("Passwort eingeben.");return}
-  if(looksLikeCode(pw)){gateErr("Das sieht aus wie der Haushalts-Schlüssel, nicht wie das Login-Passwort. Es wurde nichts gesendet.");$("#lg-pw").value="";return}
+  if(looksLikeCode(pw)){gateErr("Das sieht aus wie der Haushalts-Code, nicht wie dein Passwort.");$("#lg-pw").value="";return}
   setBusy(true,"Meldet an …");
-  const info=lsGet("kb-keyinfo");if(info){try{if(await tryPass(pw,info)){gateErr("Das ist der Haushalts-Schlüssel, nicht das Login-Passwort. Es wurde nichts gesendet.");$("#lg-pw").value="";return}}catch(e){}}
-  const {data,error}=await sb.auth.signInWithPassword({email:S.gateEmail,password:pw});
-  if(error){gateErr(isNet(error)?"Keine Verbindung.":/not confirmed/i.test(error.message||"")?"Diese Adresse ist noch nicht bestätigt.":"E-Mail oder Passwort stimmt nicht.");$("#lg-pw")?.select();return}
-  S.busy=false;S.user=data.user;S.pwDig=await pwDigest(data.user.id,pw);afterLogin()}
+  if(!(await ensureCurrent()))return;
+  let lk;try{lk=await loginKeys(S.gateEmail,pw)}catch(e){gateErr("Das hat nicht geklappt. Bitte nochmals versuchen.");return}
+  const {data,error}=await sb.auth.signInWithPassword({email:S.gateEmail,password:lk.auth});
+  if(error){gateErr(isNet(error)?"Keine Verbindung.":/not confirmed/i.test(error.message||"")?"Diese Adresse ist noch nicht bestätigt.":"E-Mail oder Passwort stimmt nicht. Konto von vor dem 14.10.2026? Dann zuerst dort öffnen, wo du noch angemeldet bist.");$("#lg-pw")?.select();return}
+  S.busy=false;S.gateHint="";S.user=data.user;S.lk=lk;S.pwDig=await pwDigest(data.user.id,pw);afterLogin()}
+function pwWeak(pw,email){const n=String(pw||"").normalize("NFC");if(n.length<12)return "Das Passwort braucht mindestens 12 Zeichen.";
+  const local=String(email||"").split("@")[0].toLowerCase();
+  if(new Set(n).size<6||/(.{3,})\1/.test(n)||/0123|1234|2345|3456|4567|5678|6789|abcd|qwert|asdf/i.test(n)||/passwort|password|kellerbox/i.test(n)||(local.length>3&&norm(n).includes(norm(local))))return "Dieses Passwort ist zu einfach. Am besten das vorgeschlagene starke Passwort nehmen.";
+  if(looksLikeCode(n))return "Das sieht aus wie der Haushalts-Code. Bitte ein anderes Passwort wählen.";return ""}
 async function doSignup(email,pw,pw2){S.gateEmail=String(email||"").trim().toLowerCase();
   if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(S.gateEmail)){gateErr("Bitte die E-Mail-Adresse eingeben.");return}
-  if(String(pw||"").length<10){gateErr("Das Passwort braucht mindestens 10 Zeichen.");return}if(pw!==pw2){gateErr("Die beiden Passwörter sind nicht gleich.");return}
-  if(looksLikeCode(pw)){gateErr("Das sieht aus wie der Haushalts-Schlüssel. Bitte ein anderes Passwort wählen. Es wurde nichts gesendet.");return}
+  const weak=pwWeak(pw,S.gateEmail);if(weak){gateErr(weak);return}if(pw!==pw2){gateErr("Die beiden Passwörter sind nicht gleich.");return}
   setBusy(true,"Wird erstellt …");
-  const info=lsGet("kb-keyinfo");if(info){try{if(await tryPass(pw,info)){gateErr("Das ist der Haushalts-Schlüssel. Bitte ein anderes Passwort wählen. Es wurde nichts gesendet.");return}}catch(e){}}
-  let res;try{res=await sb.auth.signUp({email:S.gateEmail,password:pw})}catch(e){res={error:e}}
+  if(!(await ensureCurrent()))return;
+  let lk;try{lk=await loginKeys(S.gateEmail,pw)}catch(e){gateErr("Das hat nicht geklappt. Bitte nochmals versuchen.");return}
+  let res;try{res=await sb.auth.signUp({email:S.gateEmail,password:lk.auth,options:{data:{kb_login:1}}})}catch(e){res={error:e}}
   const {data,error}=res;
   if(error){const m=String(error.message||"");
     gateErr(isNet(error)?"Keine Verbindung.":/already|registered|exists/i.test(m)?"Für diese Adresse gibt es schon ein Konto. Bitte anmelden.":/database error|saving new user|freigeschaltet/i.test(m)?"Diese Adresse ist nicht freigeschaltet.":/password/i.test(m)?"Dieses Passwort wird nicht akzeptiert. Bitte ein längeres wählen.":"Das Konto konnte nicht erstellt werden.");return}
   if(!data?.session){S.busy=false;S.signup=false;S.gateMsg="Konto erstellt. Bitte die Bestätigung im Mail-Postfach öffnen und dann anmelden.";render();return}
-  S.busy=false;S.signup=false;S.user=data.user;S.pwDig=await pwDigest(data.user.id,pw);afterLogin()}
+  S.busy=false;S.signup=false;S.user=data.user;S.lk=lk;S.pwDig=await pwDigest(data.user.id,pw);afterLogin()}
+/* Einmalig für Konten aus der Zeit vor dem 14.10.2026: neues Passwort, dessen abgeleiteten Wert Supabase bekommt */
+async function doUmstellen(){const p0=$("#um-old").value,p1=$("#um-pw").value,p2=$("#um-pw2").value,c=$("#um-code").value;
+  if(!p0){gateErr("Bitte das bisherige Passwort eingeben. Es bleibt auf diesem Gerät und dient nur zum Vergleich.");return}
+  const weak=pwWeak(p1,S.user?.email);if(weak){gateErr(weak);return}if(p1!==p2){gateErr("Die beiden Passwörter sind nicht gleich.");return}
+  if(similarPw(p1,p0)){gateErr("Bitte ein komplett neues Passwort wählen, keine Abwandlung des bisherigen. Das bisherige hat die Datenbank schon gesehen.");return}
+  if(S.keyInfo?.kind==="code"&&!canonCode(c)){gateErr("Der Haushalts-Code hat 20 Zeichen, z. B. ABCD-EFGH-JKLM-NPQR-STUV.");return}
+  setBusy(true,"Wird umgestellt …");S.gateMsg="";
+  try{if(!(await ensureCurrent()))return;
+    const keys=await tryPass(c,S.keyInfo);if(!keys){gateErr(S.keyInfo?.kind==="eigen"?"Der Haushalts-Schlüssel stimmt nicht.":"Der Haushalts-Code stimmt nicht.");$("#um-code")?.select();return}
+    const lk=await loginKeys(S.user.email,p1);
+    await writeWrap(S.user.id,keys.master,lk.wrap,S.keyInfo);
+    const {error}=await sb.auth.updateUser({password:lk.auth,data:{kb_login:1}});if(error&&!samePw(error))throw error;
+    K.aes=keys.aes;K.hmac=keys.hmac;await saveDevice(S.user.id,keys,keys.master,S.keyInfo);askPersist();
+    S.legacy=false;S.busy=false;S.pwDig=null;toast("Umgestellt. Ab jetzt reicht dein Passwort.");await resync(false)}
+  catch(e){gateErr(errText(e))}}
 const looksLikeCode=p=>{const s=String(p||"").trim();return /^[A-Za-z2-9]{4}([\s-]?[A-Za-z2-9]{4}){4}$/.test(s)&&[...s.toUpperCase().replace(/[\s-]/g,"")].every(c=>CODE_ABC.includes(c))};
 async function pwDigest(uid,pw){return hex(await crypto.subtle.digest("SHA-256",TE.encode("kb-pw\n"+uid+"\n"+String(pw).normalize("NFC"))))}
 const BAD_WORDS=["keller","box","passwort","password","schlussel","123456","qwertz"];
@@ -526,7 +631,7 @@ async function doSetup(){let pass,kind;
     if(looksLikeCode(n)){gateErr("Für die Code-Form bitte den erzeugten Code nehmen.");return}pass=n;kind="eigen"}
   else{const c=canonCode($("#su-2").value);if(!c||c!==S.setupCode){gateErr("Der eingegebene Code stimmt nicht mit dem angezeigten überein.");return}pass=c;kind="code"}
   setBusy(true,"Wird eingerichtet …");S.gateMsg="";
-  try{const salt=b64(crypto.getRandomValues(new Uint8Array(16)));const keys=await deriveKeys(pass,salt,ITER);K.aes=keys.aes;K.hmac=keys.hmac;
+  try{const salt=b64(crypto.getRandomValues(new Uint8Array(16)));let master=await deriveMaster(pass,salt,ITER);const keys=await keysFromMaster(master);K.aes=keys.aes;K.hmac=keys.hmac;
     const check=b64(await sealBytes(TE.encode("kellerboxen-ok"),"check:"+KEY_ID));let info={v:KEY_V,kind,salt,iter:ITER,check};
     const {error}=await sb.from("daten").insert({id:KEY_ID,blob:JSON.stringify(info)});
     if(error){/* Antwort verloren oder anderes Gerät war schneller: nachsehen, was gespeichert ist */
@@ -534,8 +639,10 @@ async function doSetup(){let pass,kind;
       const ex=JSON.parse(krow.blob);
       if(ex.salt!==salt){const k2=await tryPass(pass,ex).catch(()=>null);
         if(!k2){S.busy=false;K.aes=K.hmac=null;await afterLogin();S.gateMsg="Der Schlüssel wurde inzwischen auf einem anderen Gerät festgelegt. Bitte diesen eingeben.";render();return}
-        K.aes=k2.aes;K.hmac=k2.hmac;info=ex}}
-    S.keyInfo=info;lsSet("kb-keyinfo",info);await idbSet("keys:"+S.user.id,{aes:K.aes,hmac:K.hmac,salt:info.salt,info});S.busy=false;S.setupCode=null;S.pwDig=null;await resync(false)}
+        K.aes=k2.aes;K.hmac=k2.hmac;master=k2.master;info=ex}}
+    S.keyInfo=info;lsSet("kb-keyinfo",info);await saveDevice(S.user.id,{aes:K.aes,hmac:K.hmac},master,info);askPersist();
+    if(S.lk){if(!(await writeWrapRetry(S.user.id,master,S.lk.wrap,info)))toast("Konnte nicht fürs Passwort hinterlegt werden. Beim nächsten Anmelden wird nachgefragt.");S.lk=null}
+    S.busy=false;S.setupCode=null;S.pwDig=null;await resync(false)}
   catch(e){K.aes=K.hmac=null;gateErr(errText(e))}}
 async function doUnlock(p){if(!p){gateErr("Schlüssel eingeben.");return}if(S.keyInfo.kind==="code"&&!canonCode(p)){gateErr("Der Code hat 20 Zeichen, z. B. ABCD-EFGH-JKLM-NPQR-STUV.");return}
   setBusy(true,"Prüft …");S.gateMsg="";
@@ -544,9 +651,13 @@ async function doUnlock(p){if(!p){gateErr("Schlüssel eingeben.");return}if(S.ke
       if(one&&one[0]){try{await unseal(one[0].blob,one[0].id,keys.aes)}catch(e){gateErr("Dieser Schlüssel passt nicht zu den gespeicherten Daten.");return}}
       const {error:e2}=await sb.from("daten").insert({id:KEY_ID,blob:JSON.stringify(S.keyInfo)});S.restoreKey=false;
       if(e2){if(String(e2.code)==="23505"){S.busy=false;await afterLogin();return}throw e2}}
-    K.aes=keys.aes;K.hmac=keys.hmac;await idbSet("keys:"+S.user.id,{aes:K.aes,hmac:K.hmac,salt:S.keyInfo.salt,info:S.keyInfo});S.busy=false;await resync(false)}
+    K.aes=keys.aes;K.hmac=keys.hmac;await saveDevice(S.user.id,keys,keys.master,S.keyInfo);askPersist();
+    if(S.lk){if(!(await writeWrapRetry(S.user.id,keys.master,S.lk.wrap,S.keyInfo)))toast("Konnte nicht fürs Passwort hinterlegt werden. Beim nächsten Anmelden wird nachgefragt.");S.lk=null}
+    S.wrapFix=false;
+    if(S.legacy){S.busy=false;S.phase="umstellen";S.focusId="um-old";render();return}
+    S.busy=false;await resync(false)}
   catch(e){K.aes=K.hmac=null;gateErr(errText(e))}}
-async function logout(){closeSheet();const uid=S.user?.id;resetData();S.pwDig=null;S.restoreKey=false;if(uid)await idbDel("keys:"+uid);
+async function logout(){closeSheet();const uid=S.user?.id;resetData();S.pwDig=null;S.lk=null;S.gateHint="";S.restoreKey=false;if(uid)await forgetDevice(uid);
   S.user=null;S.signup=false;try{await sb.auth.signOut()}catch(e){}S.phase="login";S.gateMsg="";render()}
 
 /* ---------- Navigation und Ereignisse ---------- */
@@ -567,7 +678,11 @@ document.addEventListener("click",e=>{
   if(d.act==="help"){helpSheet();return}
   if(d.act==="logout"){logout();return}
   if(d.act==="reload"){S.gateMsg="";S.user?afterLogin():boot();return}
-  if(d.act==="forget"){if(S.user)idbDel("keys:"+S.user.id).then(()=>{closeSheet();resetData();S.phase=S.keyInfo?"unlock":"start";render();if(!S.keyInfo)afterLogin();toast("Schlüssel auf diesem Gerät gelöscht.")});return}
+  if(d.act==="forget"){if(S.user)forgetDevice(S.user.id).then(()=>{closeSheet();resetData();S.gateMsg="";
+    if(S.legacy){S.phase="umstellen";S.focusId="um-old"}else{S.gateEmail=S.user.email||"";S.gateHint="Zum Entsperren dieses Geräts dein Passwort eingeben.";S.signup=false;S.phase="login";S.focusId="lg-pw"}
+    render();toast("Schlüssel auf diesem Gerät gelöscht.")});return}
+  if(d.act==="fix-later"){if(K.aes){S.wrapFix=false;S.lk=null;S.gateMsg="";resync(false)}return}
+  if(d.act==="hint-off"){lsSet("kb-hint-home",1);render();return}
   if(d.act==="to-signup"){S.gateEmail=$("#lg-mail")?.value.trim()||S.gateEmail;S.signup=true;S.gateMsg="";S.focusId=S.gateEmail?"sg-pw":"sg-mail";render();return}
   if(d.act==="to-login"){S.gateEmail=$("#sg-mail")?.value.trim()||S.gateEmail;S.signup=false;S.gateMsg="";S.focusId=S.gateEmail?"lg-pw":"lg-mail";render();return}
   if(d.act==="copy-code"){copyCode();return}
@@ -596,17 +711,27 @@ document.addEventListener("click",e=>{
   else if(a==="toggle-edit"){S.edit=!S.edit;S.armed=null;render()}
   else if(a==="save-pdf")savePdf();
   else if(a==="export"){closeSheet();exportData()}
-  else if(a==="pw")pwSheet()});
+  else if(a==="pw"){if(S.legacy){closeSheet();S.phase="umstellen";S.focusId="um-old";render()}else pwSheet()}});
 document.addEventListener("submit",async e=>{const f=e.target;e.preventDefault();
-  if(S.busy&&/^(loginform|signupform|setupform|unlockform)$/.test(f.id))return;
+  if(S.busy&&/^(loginform|signupform|setupform|unlockform|umform)$/.test(f.id))return;
   if(f.id==="loginform")doLogin($("#lg-mail").value,$("#lg-pw").value);
   else if(f.id==="signupform")doSignup($("#sg-mail").value,$("#sg-pw").value,$("#sg-pw2").value);
   else if(f.id==="setupform")doSetup();
   else if(f.id==="unlockform")doUnlock($("#ul-pw").value);
-  else if(f.id==="pwform"){const p1=$("#pw-1").value,p2=$("#pw-2").value,er=$("#pw-err");if(p1.length<12){er.textContent="Mindestens 12 Zeichen.";return}if(p1!==p2){er.textContent="Die beiden Eingaben sind nicht gleich.";return}
-    if(looksLikeCode(p1)){er.textContent="Das sieht aus wie der Haushalts-Schlüssel. Bitte ein anderes Passwort wählen.";return}
-    if(S.keyInfo&&await tryPass(p1,S.keyInfo).catch(()=>null)){er.textContent="Das ist der Haushalts-Schlüssel. Bitte ein anderes Passwort wählen.";return}
-    const {error}=await sb.auth.updateUser({password:p1});if(error){er.textContent="Hat nicht geklappt. Bitte nochmals versuchen.";return}closeSheet();toast("Login-Passwort geändert.")}
+  else if(f.id==="umform")doUmstellen();
+  else if(f.id==="pwform"){const p0=$("#pw-0").value,p1=$("#pw-1").value,p2=$("#pw-2").value,er=$("#pw-err"),btn=f.querySelector(".btn:not(.ghost)");
+    const weak=pwWeak(p1,S.user?.email);if(weak){er.textContent=weak;return}if(p1!==p2){er.textContent="Die beiden Eingaben sind nicht gleich.";return}
+    if(btn.disabled)return;btn.disabled=true;er.textContent="Wird geändert …";
+    try{if(!(await ensureCurrent()))return;
+      const old=await loginKeys(S.user.email,p0);const w=await readWrap(S.user.id,old.wrap,S.keyInfo);
+      if(w.bad){er.textContent="Das bisherige Passwort stimmt nicht.";return}
+      if(!w.master){er.textContent="Dafür einmal abmelden, neu anmelden und den Haushalts-Code eingeben.";return}
+      if(similarPw(p1,p0)){er.textContent="Bitte ein komplett neues Passwort wählen.";return}
+      const nk=await loginKeys(S.user.email,p1);
+      await writeWrap(S.user.id,w.master,nk.wrap,S.keyInfo,1);
+      const {error}=await sb.auth.updateUser({password:nk.auth});if(error&&!samePw(error))throw error;
+      await writeWrap(S.user.id,w.master,nk.wrap,S.keyInfo);await delWrap(S.user.id,1);closeSheet();toast("Passwort geändert.")}
+    catch(e){er.textContent=errText(e)}finally{btn.disabled=false}}
   else if(f.id==="addform"&&S.phase==="app"){const i=$("#add");const v=i.value;i.value="";const nr=S.boxNr;S.addDraft="";DRAFTS.delete(nr);const failed=await addItems(nr,v.split(/\r?\n|;/).map(parseLine));
     if(failed.length)restoreDraft(nr,failed);else $("#add")?.focus()}});
 /* Nicht gespeicherte Eingaben gehen nie verloren: pro Box merken, vor den aktuellen Text setzen */

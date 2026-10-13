@@ -125,5 +125,16 @@ create policy "fotos loeschen" on storage.objects for delete to authenticated us
 --    delete from public.mitglieder where lower(email) = lower('adresse@beispiel.ch');
 --    delete from auth.users where lower(email) = lower('adresse@beispiel.ch');
 --
---    Login-Passwörter nie in der Form XXXX-XXXX-XXXX-XXXX-XXXX wählen: so sieht der Haushalts-Schlüssel aus,
---    und die App sendet solche Eingaben bewusst nicht ab.
+--    Passwort vergessen: nur das Login-Konto und seinen hinterlegten Schlüssel löschen, die Freischaltung in
+--    mitglieder bleibt. Danach in der App «Konto erstellen» und einmal den Haushalts-Code eingeben; die Daten
+--    bleiben erhalten. Nie ein Passwort im Dashboard, per Admin-API oder per SQL setzen und keine
+--    Wiederherstellungs-Mail senden: die App sendet nie das Passwort selbst, ein so gesetztes geht nicht.
+--
+--    delete from public.daten where id in (
+--      select 'w' || left(encode(sha256(convert_to(v.p || u.id::text, 'UTF8')), 'hex'), 32)
+--      from auth.users u, (values ('kb-wrap:'), ('kb-wrap-next:')) v(p)
+--      where lower(u.email) = lower('adresse@beispiel.ch'));
+--    delete from auth.users where lower(email) = lower('adresse@beispiel.ch');
+--
+--    Konten aus der Zeit vor dem 14.10.2026 (Passwort noch im Klartext übertragen) finden:
+--    select email from auth.users where coalesce((raw_user_meta_data->>'kb_login')::int, 0) < 1;

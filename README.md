@@ -9,11 +9,18 @@ Läuft auf dem iPhone im Browser oder als Symbol auf dem Home-Bildschirm.
   bevor sie gespeichert werden: AES-GCM 256, Schlüssel per PBKDF2-SHA256 (1 000 000 Runden) und HKDF aus dem
   Haushalts-Schlüssel abgeleitet.
 - Der Haushalts-Schlüssel ist standardmässig ein zufälliger Code mit 20 Zeichen (rund 100 Bit). Er wird nie
-  gesendet und nie im Klartext gespeichert. Auf jedem Gerät bleibt nur ein nicht auslesbarer Schlüssel im Browser.
+  gesendet und nie im Klartext gespeichert. Jedes Mitglied gibt ihn genau einmal ein; danach liegt er pro Person
+  mit deren Passwort verpackt in der Datenbank, und auf neuen Geräten genügen E-Mail und Passwort.
+- Das Passwort selbst erreicht Supabase nie. Die App leitet daraus im Browser zwei getrennte Werte ab
+  (PBKDF2-SHA256, 600 000 Runden, dann HKDF): einen Anmeldewert für Supabase und einen Schlüssel, der den
+  Haushalts-Schlüssel verpackt. Darum sind starke Passwörter wichtig (mindestens 12 Zeichen, am besten vom
+  Passwort-Manager erzeugt).
+- Auf dem Gerät bleibt der Schlüssel als nicht auslesbarer Browser-Schlüssel; kann ein Browser das nicht
+  (manche iPhone-Ansichten), als Rohwert im Browser-Speicher. Er verlässt das Gerät nie.
 - Die Datenbank (Supabase) sieht nur unlesbare Datensätze mit zufälligen Kennungen und einheitlicher Länge.
   Sichtbar bleiben für den Anbieter nur die Anzahl der Einträge, Änderungszeitpunkte und die ungefähre
   Grösse der Fotos.
-- Zugang haben nur freigeschaltete Konten (Tabelle `mitglieder`), öffentliche Registrierung ist ausgeschaltet.
+- Zugang haben nur freigeschaltete Adressen (Tabelle `mitglieder`); nur für sie lassen sich Konten erstellen.
   Die Schlüsselinfo in der Datenbank kann nicht geändert oder gelöscht werden.
 - Sicherungen («?» › «Sicherung herunterladen») sind ebenfalls verschlüsselt.
 - Die App sendet nie etwas, das wie der Haushalts-Schlüssel aussieht, als Login-Passwort. Ein eigener Schlüssel
@@ -42,7 +49,16 @@ Läuft auf dem iPhone im Browser oder als Symbol auf dem Home-Bildschirm.
    Gratis-Projekt nicht nach 7 Tagen ohne Zugriff pausiert.
 
 Beim ersten Anmelden erzeugt die App den Haushalts-Schlüssel. Danach mit «?» › «Sicherung importieren»
-bestehende Daten übernehmen. Weitere Geräte geben den Schlüssel einmal ein.
+bestehende Daten übernehmen. Weitere Mitglieder geben den Code einmal ein, danach genügt überall das Passwort.
+Konten aus der Zeit vor dem 14.10.2026 stellt die App einmalig um: ein komplett neues Passwort (das bisherige
+wird nur im Browser verglichen, nie gesendet) und einmal der Code. Vorher die App auf allen Geräten ganz
+schliessen und neu öffnen, damit keine alte Version mehr läuft.
+
+Passwort vergessen: Der Verwalter löscht das Login-Konto (SQL am Ende von `setup.sql`), danach «Konto erstellen»
+und einmal den Haushalts-Code. Nie ein Passwort im Supabase-Dashboard setzen.
+
+Auf dem iPhone die App über Safari › Teilen › «Zum Home-Bildschirm» ablegen und danach immer über dieses
+Symbol öffnen. Safari und das Symbol haben getrennten Speicher; ein Link aus WhatsApp öffnet Safari.
 
 ## Etiketten
 
